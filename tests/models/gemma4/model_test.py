@@ -33,6 +33,7 @@ class ModelTest(absltest.TestCase):
     config.num_heads = 4
     config.head_dim = 64
     config.num_kv_heads = 1
+    config.frac_shared_layers = 0.0
 
     rngs = nnx.Rngs(0)
     model = model_lib.Gemma4(config, rngs=rngs)
