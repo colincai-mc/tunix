@@ -17,7 +17,7 @@ set -x # Enable xtrace
 
 python3 -m tunix.cli.peft_main \
   base_config.yaml \
-  model_config.model_name="llama3.2-3b" \
+  model_config.model_name="llama-3.2-3b" \
   model_config.model_id="meta-llama/Llama-3.2-3B" \
   model_config.model_source="huggingface" \
   model_config.model_download_path="/tmp/models/llama3.2-3b" \

@@ -41,9 +41,9 @@ echo "Rounded warmup steps: $warmup_steps"
 python3 -m tunix.cli.grpo_main \
   tunix/cli/base_config.yaml \
   override_config_file=examples/rl/grpo/gsm8k/configs/gemma2_2b.yaml \
-  model_config.model_download_path="/tmp/models/gemma2-2b" \
+  model_config.model_download_path="/tmp/models/gemma-2-2b" \
   model_config.intermediate_ckpt_dir="/tmp/intermediate_ckpt/1" \
-  tokenizer_config.tokenizer_path="/tmp/models/gemma2-2b/models/google/gemma-2/flax/gemma2-2b-it/1/tokenizer.model" \
+  tokenizer_config.tokenizer_path="/tmp/models/gemma-2-2b/models/google/gemma-2/flax/gemma-2-2b-it/1/tokenizer.model" \
   batch_size=$batch_size \
   num_batches=$num_batches \
   num_train_epochs=$num_train_epochs \

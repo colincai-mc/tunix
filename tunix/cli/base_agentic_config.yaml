@@ -14,18 +14,23 @@
 
 ################################## LOAD MODEL ##################################
 model_config: &base_model_config
-  # The unique full name identifier of the model, matching exactly with the name used in Huggingface
-  # e.g., "gemma-2b","llama-3.1-8b", or Kaggle, e.g., "gemma2-2b-it".
-  model_name: "llama3.1-8b"
+  # The unique full name identifier of the model.
+  # Can be the Huggingface model name, e.g., "gemma-2b", "llama-3.1-8b", or
+  # Tunix standard format, e.g., "gemma2_2b_it", "llama3p1_8b".
+  model_name: "llama-3.1-8b"
 
   # Chagne model source to your downloading model workflow. Example: "kaggle" | "huggingface" | "gcs" | ""
   model_source: "huggingface"
 
-  # Full model name identifier (case sensitive), as it appears on Huggingface, or Kaggle, e.g.,
-  # "meta-llama/Llama-3.1-8B" or "google/gemma-2/flax/gemma2-2b-it".
+  # Model identifier used by Tunix AutoModel.
+  # Can be a HuggingFace Hub model ID (e.g., "google/gemma-2-2b-it") or
+  # a Tunix native model config ID (e.g., "gemma2_2b_it", "llama3p1_8b").
   model_id: "meta-llama/Llama-3.1-8B"
 
-  # For models from GCS or internal sources, specify the path to the model files.
+  # Path or identifier for model source.
+  # If model_source is Kaggle, this is Kaggle Hub model identifier (e.g. "google/gemma-2/flax/gemma2-2b-it").
+  # If model_source is GCS or internal, this is the GCS/CNS path to model files.
+  # If model_source is Maxtext, this is the checkpoint path.
   model_path: ""
 
   ################################## Checkpoint ##################################

@@ -17,28 +17,12 @@ def _get_all_models_test_parameters():
       dict(testcase_name="gemma-2b-it", model_name="gemma-2b-it"),
       dict(testcase_name="gemma-7b", model_name="gemma-7b"),
       dict(testcase_name="gemma-7b-it", model_name="gemma-7b-it"),
-      dict(testcase_name="gemma1.1-2b-it", model_name="gemma1.1-2b-it"),
-      dict(testcase_name="gemma1.1-7b-it", model_name="gemma1.1-7b-it"),
       dict(testcase_name="gemma-1.1-2b-it", model_name="gemma-1.1-2b-it"),
       dict(testcase_name="gemma-1.1-7b-it", model_name="gemma-1.1-7b-it"),
-      dict(testcase_name="gemma2-2b", model_name="gemma2-2b"),
-      dict(testcase_name="gemma2-2b-it", model_name="gemma2-2b-it"),
-      dict(testcase_name="gemma2-9b", model_name="gemma2-9b"),
-      dict(testcase_name="gemma2-9b-it", model_name="gemma2-9b-it"),
       dict(testcase_name="gemma-2-2b", model_name="gemma-2-2b"),
       dict(testcase_name="gemma-2-2b-it", model_name="gemma-2-2b-it"),
       dict(testcase_name="gemma-2-9b", model_name="gemma-2-9b"),
       dict(testcase_name="gemma-2-9b-it", model_name="gemma-2-9b-it"),
-      dict(testcase_name="gemma3-270m", model_name="gemma3-270m"),
-      dict(testcase_name="gemma3-270m-it", model_name="gemma3-270m-it"),
-      dict(testcase_name="gemma3-1b-pt", model_name="gemma3-1b-pt"),
-      dict(testcase_name="gemma3-1b-it", model_name="gemma3-1b-it"),
-      dict(testcase_name="gemma3-4b-pt", model_name="gemma3-4b-pt"),
-      dict(testcase_name="gemma3-4b-it", model_name="gemma3-4b-it"),
-      dict(testcase_name="gemma3-12b-pt", model_name="gemma3-12b-pt"),
-      dict(testcase_name="gemma3-12b-it", model_name="gemma3-12b-it"),
-      dict(testcase_name="gemma3-27b-pt", model_name="gemma3-27b-pt"),
-      dict(testcase_name="gemma3-27b-it", model_name="gemma3-27b-it"),
       dict(testcase_name="gemma-3-270m", model_name="gemma-3-270m"),
       dict(testcase_name="gemma-3-270m-it", model_name="gemma-3-270m-it"),
       dict(testcase_name="gemma-3-1b-pt", model_name="gemma-3-1b-pt"),
@@ -49,32 +33,18 @@ def _get_all_models_test_parameters():
       dict(testcase_name="gemma-3-12b-it", model_name="gemma-3-12b-it"),
       dict(testcase_name="gemma-3-27b-pt", model_name="gemma-3-27b-pt"),
       dict(testcase_name="gemma-3-27b-it", model_name="gemma-3-27b-it"),
-      dict(testcase_name="llama3-70b", model_name="llama3-70b"),
       dict(testcase_name="llama-3-70b", model_name="llama-3-70b"),
-      dict(testcase_name="llama3.1-70b", model_name="llama3.1-70b"),
       dict(testcase_name="llama-3.1-70b", model_name="llama-3.1-70b"),
-      dict(testcase_name="llama3.1-405b", model_name="llama3.1-405b"),
       dict(testcase_name="llama-3.1-405b", model_name="llama-3.1-405b"),
-      dict(testcase_name="llama3.1-8b", model_name="llama3.1-8b"),
       dict(testcase_name="llama-3.1-8b", model_name="llama-3.1-8b"),
-      dict(testcase_name="llama3.2-1b", model_name="llama3.2-1b"),
       dict(
           testcase_name="llama-3.2-1b-instruct",
           model_name="llama-3.2-1b-instruct",
       ),
-      dict(
-          testcase_name="llama3.2-1b-instruct",
-          model_name="llama3.2-1b-instruct",
-      ),
       dict(testcase_name="llama-3.2-1b", model_name="llama-3.2-1b"),
-      dict(testcase_name="llama3.2-3b", model_name="llama3.2-3b"),
       dict(
           testcase_name="llama-3.2-3b-instruct",
           model_name="llama-3.2-3b-instruct",
-      ),
-      dict(
-          testcase_name="llama3.2-3b-instruct",
-          model_name="llama3.2-3b-instruct",
       ),
       dict(testcase_name="llama-3.2-3b", model_name="llama-3.2-3b"),
       dict(testcase_name="qwen2.5-0.5b", model_name="qwen2.5-0.5b"),
@@ -278,18 +248,13 @@ class AutoModelTest(parameterized.TestCase):
           expected_version="2b",
       ),
       dict(
-          testcase_name="gemma2-2b-it",
-          model_name="gemma2-2b-it",
-          expected_version="2-2b_it",
-      ),
-      dict(
           testcase_name="gemma-2-2b-it",
           model_name="gemma-2-2b-it",
           expected_version="2-2b_it",
       ),
       dict(
-          testcase_name="gemma1.1-2b-it",
-          model_name="gemma1.1-2b-it",
+          testcase_name="gemma-1.1-2b-it",
+          model_name="gemma-1.1-2b-it",
           expected_version="1.1-2b_it",
       ),
   )
@@ -310,6 +275,60 @@ class AutoModelTest(parameterized.TestCase):
     mock_model_lib.Gemma.from_params.assert_called_once_with(
         mock_params_lib.load_and_format_params.return_value,
         version=expected_version,
+    )
+
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="gemma-2b",
+          model_name="gemma-2b",
+          expected_dir_name="2b",
+      ),
+      dict(
+          testcase_name="gemma-1.1-2b-it",
+          model_name="gemma-1.1-2b-it",
+          expected_dir_name="gemma-1.1-2b-it",
+      ),
+      dict(
+          testcase_name="gemma-1.1-7b-it",
+          model_name="gemma-1.1-7b-it",
+          expected_dir_name="gemma-1.1-7b-it",
+      ),
+      dict(
+          testcase_name="gemma-2-9b",
+          model_name="gemma-2-9b",
+          expected_dir_name="gemma-2-9b",
+      ),
+  )
+  @mock.patch.object(automodel, "create_gemma_model_from_params", autospec=True)
+  @mock.patch.object(automodel, "_get_gemma_base_model", autospec=True)
+  @mock.patch("tunix.models.automodel.ocp.StandardCheckpointer", autospec=True)
+  @mock.patch("os.path.exists", return_value=False)
+  def test_create_gemma_model_with_nnx_conversion_dir_name(
+      self,
+      mock_exists,
+      mock_checkpointer,
+      mock_get_gemma_base_model,
+      mock_create_gemma_model_from_params,
+      model_name,
+      expected_dir_name,
+  ):
+    del mock_exists, mock_checkpointer, mock_get_gemma_base_model
+    mock_create_gemma_model_from_params.return_value = (
+        mock.Mock(),
+        mock.Mock(),
+    )
+    mesh = jax.sharding.Mesh(jax.devices(), ("devices",))
+    automodel.create_gemma_model_with_nnx_conversion(
+        model_name=model_name,
+        ckpt_path="dummy_ckpt_path",
+        intermediate_ckpt_dir="dummy_intermediate_ckpt_dir",
+        rng_seed=0,
+        mesh=mesh,
+    )
+    mock_create_gemma_model_from_params.assert_called_once()
+    calls = mock_create_gemma_model_from_params.call_args_list
+    self.assertEqual(
+        calls[0][0][0], os.path.join("dummy_ckpt_path", expected_dir_name)
     )
 
   @parameterized.named_parameters(

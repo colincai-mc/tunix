@@ -78,7 +78,7 @@ def call_model_config(model_name: str) -> Any:
 
   Args:
       model_name: The string indicating which model config function to call
-        (e.g., "gemma-2b", "llama3.1-8b", "qwen2.5-0.5b").
+        (e.g., "gemma-2b", "llama-3.1-8b", "qwen2.5-0.5b").
 
   Returns:
       The result from calling the dynamically determined function.
@@ -191,9 +191,9 @@ def create_gemma_model_with_nnx_conversion(
         version_dashed = naming_info.model_version.replace('_', '-')
 
       if naming_info.model_family == 'gemma2':
-        dir_name = f'gemma2-{version_dashed}'
+        dir_name = f'gemma-2-{version_dashed}'
       elif naming_info.model_family == 'gemma1p1':
-        dir_name = f'1.1-{version_dashed}'
+        dir_name = f'gemma-1.1-{version_dashed}'
       else:  # gemma
         dir_name = version_dashed
 
@@ -260,7 +260,7 @@ def create_gemma3_model_from_checkpoint(
 
   Args:
       ckpt_path: The path to the checkpoint.
-      model_name: The name of the model (e.g., "qwen2.5-0.5b", "llama3.2-3b").
+      model_name: The name of the model (e.g., "qwen2.5-0.5b", "llama-3.2-3b").
       mesh: Mesh object for device layout.
 
   Returns:
@@ -326,7 +326,7 @@ def create_model_from_safe_tensors(
   """Dynamically imports the correct module and calls `create_model_from_safe_tensors` based on the model_name.
 
   Args:
-      model_name: The name of the model (e.g., "qwen2.5-0.5b", "llama3.2-3b").
+      model_name: The name of the model (e.g., "qwen2.5-0.5b", "llama-3.2-3b").
       file_dir: Directory containing the safe tensors.
       model_config: Model configuration object.
       mesh: Mesh object for device layout.
