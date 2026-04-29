@@ -32,8 +32,11 @@ warmup_ratio="${warmup_ratio:-0.1}"
 batch_size="${batch_size:-128}"
 mini_batch_size="${mini_batch_size:-128}"
 max_response_length="${max_response_length:-8192}"
-trainer_mesh="${trainer_mesh:-(4,1)}"
-rollout_mesh="${rollout_mesh:-(4,1)}"
+total_tpus="${total_tpus:-8}"
+
+axis_size=$((total_tpus / 2))
+trainer_mesh="${trainer_mesh:-($axis_size,1)}"
+rollout_mesh="${rollout_mesh:-($axis_size,1)}"
 
 checkpoint_dir="${checkpoint_dir:-gs://tunix/rl/checkpoints/01}"
 checkpoint_suffix="${checkpoint_suffix:-$(printf '%04d' "$((RANDOM % 10000))")}"

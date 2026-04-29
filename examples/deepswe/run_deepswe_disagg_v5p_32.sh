@@ -42,9 +42,12 @@ rollout_micro_batch_size="${rollout_micro_batch_size:-1}"
 
 num_generations="${num_generations:-2}"
 max_response_length="${max_response_length:-8192}"
+total_tpus="${total_tpus:-32}"
 
-trainer_mesh="${trainer_mesh:-(8,2)}"
-rollout_mesh="${rollout_mesh:-(2,8)}"
+# mesh shapes are (2, X) or (X, 2) for each of trainer or rollout.
+axis_size=$((total_tpus / 4))
+trainer_mesh="${trainer_mesh:-($axis_size,2)}"
+rollout_mesh="${rollout_mesh:-(2,$axis_size)}"
 
 checkpoint_dir="${checkpoint_dir:-gs://tunix/rl/checkpoints/01}"
 checkpoint_suffix="${checkpoint_suffix:-$(printf '%04d' "$((RANDOM % 10000))")}"

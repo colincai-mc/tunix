@@ -17,16 +17,14 @@
 # tunix/cli/base_agentic_config.yaml plus explicit CLI overrides.
 #
 # Usage:
-#   checkpoint_dir="" bash /examples/rl/grpo/gsm8k/run_qwen3_8b.sh
+#   checkpoint_dir="" bash /examples/rl/grpo/gsm8k/run_qwen3_8b_maxtext.sh
 #
 # Run from the tunix repo root.
 
 set -euo pipefail
 
-export SKIP_JAX_PRECOMPILE=true
-
 model_name="${model_name:-Qwen3-8B}"
-model_id="${model_id:-Qwen/Qwen3-8B}"
+model_id="${model_id:-/tmp/maxtext_qwen3_8b}"
 tokenizer_path="${tokenizer_path:-$model_id}"
 
 batch_size="${batch_size:-8}"
@@ -41,9 +39,11 @@ rollout_micro_batch_size="${rollout_micro_batch_size:-8}"
 compute_logps_micro_batch_size="${compute_logps_micro_batch_size:-1}"
 
 num_generations="${num_generations:-4}"
+total_tpus="${total_tpus:-8}"
 
-train_mesh="${train_mesh:-(8,1)}"
-rollout_mesh="${rollout_mesh:-(1,8)}"
+axis_size=$((total_tpus / 2))
+train_mesh="${train_mesh:-($axis_size,1)}"
+rollout_mesh="${rollout_mesh:-(1,$axis_size)}"
 
 checkpoint_dir="${checkpoint_dir:-gs://tunix/rl/checkpoints/gsm8k/qwen3/01}"
 checkpoint_suffix="${checkpoint_suffix:-$(printf '%04d' "$((RANDOM % 10000))")}"
@@ -73,10 +73,15 @@ python -m tunix.cli.grpo_main \
   `# -- Model ------------------------------------------------------------` \
   model_config.model_name="$model_name" \
   model_config.model_id="$model_id" \
-  model_config.model_source="huggingface" \
+  model_config.model_source="maxtext" \
   model_config.rng_seed=42 \
   model_config.model_display=false \
   model_config.remat_config=3 \
+  `# -- Maxtext specific configs mapping ---------------------------------` \
+  model_config.kwargs.base_emb_dim=4096 \
+  model_config.kwargs.sparse_matmul=true \
+  model_config.kwargs.remat_policy="minimal" \
+  `# -- Mesh configurations ----------------------------------------------` \
   actor_model_config.mesh.shape="$train_mesh" \
   actor_model_config.mesh.axis_names="('fsdp','tp')" \
   reference_model_config.mesh=null \
@@ -165,7 +170,7 @@ python -m tunix.cli.grpo_main \
   rl_training_config.checkpoint_root_directory="$checkpoint_dir" \
   rl_training_config.checkpointing_options.save_interval_steps=250 \
   rl_training_config.checkpointing_options.max_to_keep=4 \
-  rl_training_config.metrics_logging_options.log_dir="/tmp/tensorboard/gsm8k_qwen3_8b" \
+  rl_training_config.metrics_logging_options.log_dir="/tmp/tensorboard/gsm8k_qwen3_8b_maxtext" \
   rl_training_config.metrics_logging_options.flush_every_n_steps=20 \
   \
   "$@"
