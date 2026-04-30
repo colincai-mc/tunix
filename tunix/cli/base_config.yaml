@@ -62,10 +62,10 @@ model_config: &base_model_config
   lora_config: {}
 
   ################################## MESH ##################################
-  mesh:
-    shape: "(2,2)"
-    # "('fsdp',)"
-    axis_names: "('fsdp','tp')"
+  # Base config should not set mesh, as it can be different for each role.
+  # mesh:
+  #   shape: "(2,2)"
+  #   axis_names: "('fsdp','tp')"
 
 actor_model_config:
   <<: *base_model_config
@@ -213,6 +213,8 @@ rollout_config:
 ############################### Other RL  Config ###############################
 
 rollout_engine: "vanilla"
+vllm_config: {}
+sglang_jax_config: {}
 
 offload_to_cpu: false
 

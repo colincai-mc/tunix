@@ -21,12 +21,14 @@ batch_size=${batch_size:-8}
 num_train_epochs=${num_train_epochs:-1}
 warmup_ratio=${warmup_ratio:-0.1}
 train_fraction=${train_fraction:-0.8}
+actor_mesh_shape=${actor_mesh_shape:-"(2,4)"}
 
 echo "Using parameters:"
 echo "  Batch Size: $batch_size"
 echo "  Num Epochs: $num_train_epochs"
 echo "  Warmup Ratio: $warmup_ratio"
 echo "  Train Fraction: $train_fraction"
+echo "  Actor Mesh Shape: $actor_mesh_shape"
 
 python3 -m tunix.cli.grpo_main \
   base_config.yaml \
@@ -36,16 +38,13 @@ python3 -m tunix.cli.grpo_main \
   model_config.use_flash_attention=true \
   model_config.flash_attention_block_size=256 \
   model_config.intermediate_ckpt_dir="/tmp/intermediate_ckpt/${model_name}" \
-  model_config.mesh.shape="(2,4)" \
-  model_config.mesh.axis_names="('fsdp','tp')" \
   model_config.rng_seed=42 \
   actor_model_config.lora_config.rank=64 \
   actor_model_config.lora_config.alpha=64.0 \
-  actor_model_config.lora_config.module_path=".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj|.*attn_vec_einsum" \
-  actor_model_config.mesh.shape="(2,4)" \
+  actor_model_config.lora_config.module_path=".*q_proj|.*k_proj|.*v_proj|.*o_proj|.*gate_proj|.*down_proj|.*up_proj" \
+  actor_model_config.mesh.shape="$actor_mesh_shape" \
   actor_model_config.mesh.axis_names="('fsdp','tp')" \
-  rollout_model_config.mesh.shape="(2,4)" \
-  rollout_model_config.mesh.axis_names="('fsdp','tp')" \
+  rollout_model_config.same_mesh_as="actor" \
   tokenizer_config.tokenizer_path=Qwen/${model_name} \
   tokenizer_config.tokenizer_type=huggingface \
   tokenizer_config.add_bos=false \
