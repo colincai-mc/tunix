@@ -110,6 +110,7 @@ class GRPOConfig(agentic_rl_learner.AgenticRLConfig):
   degenerate_group_masking: bool = (
       True  # Whether to mask out degenerate groups with all-0 advantages.
   )
+  use_rollout_logps: bool = True
 
   def __post_init__(self):
     if self.num_generations <= 1:
@@ -370,19 +371,20 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
               :max_response_length
           ]
       )
-      if old_logprobs is not None:
-        padded_old_logprobs.append(
-            agentic_utils.right_pad(
-                old_logprobs,
-                length=max_response_length,
-                pad=0.0,
-                dtype=old_logprobs.dtype,
-            )[:max_response_length]
-        )
-      else:
-        padded_old_logprobs.append(
-            np.zeros(max_response_length, dtype=np.float32)
-        )
+      if self.algo_config.use_rollout_logps:
+        if old_logprobs is not None:
+          padded_old_logprobs.append(
+              agentic_utils.right_pad(
+                  old_logprobs,
+                  length=max_response_length,
+                  pad=0.0,
+                  dtype=old_logprobs.dtype,
+              )[:max_response_length]
+          )
+        else:
+          padded_old_logprobs.append(
+              np.zeros(max_response_length, dtype=np.float32)
+          )
 
     prompt_ids = jnp.asarray(padded_prompt_ids)
     prompt_mask = prompt_ids != pad_value
@@ -394,12 +396,19 @@ class GRPOLearner(agentic_rl_learner.AgenticRLLearner[TGrpoConfig]):
         completion_ids.shape,
     )
 
-    if padded_old_logprobs and len(padded_old_logprobs) == len(
-        completion_tokens_list
-    ):
+    if self.algo_config.use_rollout_logps and padded_old_logprobs:
       old_per_token_logps = jnp.asarray(padded_old_logprobs)
-    else:
+    elif self.algo_config.use_rollout_logps:
       old_per_token_logps = None
+    else:
+      old_per_token_logps = self.rl_cluster.get_actor_per_token_logps(
+          prompt_tokens=prompt_ids,
+          completion_tokens=completion_ids,
+          pad_id=pad_value,
+          eos_id=eos_value,
+          micro_batch_size=None,
+          completion_mask=completion_mask,
+      )
 
     if self.algo_config.num_iterations > 1 and old_per_token_logps is None:
       raise RuntimeError(

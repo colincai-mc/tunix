@@ -1304,6 +1304,129 @@ class AgenticGrpoLearnerTest(parameterized.TestCase):
         mock_get_ref.assert_not_called()
         self.assertIsNone(train_example.ref_per_token_logps)
 
+  @parameterized.named_parameters(
+      dict(
+          testcase_name="use_rollout_logps_true",
+          use_rollout_logps=True,
+          return_logprobs=True,
+          expect_get_actor_logps=False,
+      ),
+      dict(
+          testcase_name="use_rollout_logps_false",
+          use_rollout_logps=False,
+          return_logprobs=False,
+          expect_get_actor_logps=True,
+      ),
+  )
+  def test_use_rollout_logps(
+      self, use_rollout_logps, return_logprobs, expect_get_actor_logps
+  ):
+    vocab = _mock_vocab()
+    tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)
+    model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    ref_model = test_common.ToyTransformer(
+        config=test_common.ModelConfig(vocab_size=vocab.GetPieceSize()),
+        rngs=nnx.Rngs(0),
+    )
+    mesh = pxla.thread_resources.env.physical_mesh
+    cluster_config = rl_cluster_lib.ClusterConfig(
+        role_to_mesh={
+            rl_cluster_lib.Role.ACTOR: mesh,
+            rl_cluster_lib.Role.REFERENCE: mesh,
+            rl_cluster_lib.Role.ROLLOUT: mesh,
+        },
+        rollout_engine="vanilla",
+        offload_to_cpu=False,
+        training_config=rl_cluster_lib.RLTrainingConfig(
+            actor_optimizer=optax.sgd(1e-3),
+            eval_every_n_steps=10,
+            max_steps=10,
+        ),
+        rollout_config=base_rollout.RolloutConfig(
+            max_prompt_length=32,
+            max_tokens_to_generate=10,
+            return_logprobs=return_logprobs,
+        ),
+    )
+    rl_cluster = rl_cluster_lib.RLCluster(
+        actor=model,
+        reference=ref_model,
+        tokenizer=tokenizer,
+        cluster_config=cluster_config,
+    )
+
+    grpo_config = agentic_grpo_learner.GRPOConfig(
+        beta=0.0,
+        force_compute_kl=False,
+        max_response_length=10,
+        num_generations=2,
+        num_iterations=1,
+        use_rollout_logps=use_rollout_logps,
+    )
+    learner = agentic_grpo_learner.GRPOLearner(
+        rl_cluster=rl_cluster,
+        reward_fns=reward_fn_1,
+        algo_config=grpo_config,
+        chat_parser=MockChatParser(),
+    )
+
+    # Mock trajectories to pass into _process_results
+    class MockTraj:
+
+      def __init__(self, index):
+        self.traj = {
+            "conversation_text": [
+                {"role": "assistant", "content": f"msg {index}"}
+            ],
+            "conversation_tokens": np.array([1, 2, 3]),
+            "conversation_masks": np.array([1, 1, 1]),
+            "old_logprobs": (
+                np.full(3, 1.0, dtype=np.float32) if return_logprobs else None
+            ),
+            "policy_version": 0,
+            "trajectory_reward": 1.0,
+            "prompt_tokens": np.array([4, 5]),
+            "original_input": {"prompts": "hello"},
+            "group_id": "test_group",
+        }
+
+    trajectories = [MockTraj(0), MockTraj(1)]
+
+    with mock.patch.object(
+        rl_cluster,
+        "get_actor_per_token_logps",
+        return_value=jnp.full((2, 10), -1.0),
+        autospec=True,
+    ) as mock_get_actor_logps:
+      results = learner._process_results(trajectories, expected_step=1)
+      self.assertLen(results, 1)
+      train_example = results[0]
+
+      if expect_get_actor_logps:
+        mock_get_actor_logps.assert_called_once()
+        self.assertIsNotNone(train_example.old_per_token_logps)
+        # If get_actor_per_token_logps is called, logps should be all -1.0
+        # as per the mock return value.
+        np.testing.assert_allclose(
+            train_example.old_per_token_logps, jnp.full((2, 10), -1.0)
+        )
+      else:
+        mock_get_actor_logps.assert_not_called()
+        if return_logprobs:
+          self.assertIsNotNone(train_example.old_per_token_logps)
+          # If get_actor_per_token_logps is not called and return_logprobs is
+          # True, logps should come from rollout: 1.0 for first 3 tokens,
+          # 0.0 for padding.
+          np.testing.assert_allclose(
+              train_example.old_per_token_logps,
+              np.array([[1.0] * 3 + [0.0] * 7] * 2),
+          )
+        else:
+          self.assertIsNone(train_example.old_per_token_logps)
+
   def test_exception_handling(self):
     vocab = test_common.MockVocab()
     tokenizer = tokenizer_adapter.TokenizerAdapter(vocab)

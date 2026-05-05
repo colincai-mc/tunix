@@ -91,6 +91,7 @@ class AgenticRLConfig(algo_config_lib.AlgorithmConfig):
   episode_timeout: float = 1800.0
   filter_statuses: Optional[Set] = None
   overlong_filter: bool = False
+  use_rollout_logps: bool = True
 
 
 TConfig = TypeVar("TConfig", bound=AgenticRLConfig)
@@ -253,10 +254,11 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
             f"max_response_length ({self.algo_config.max_response_length}). "
             "Please align these configurations before initializing RLCluster."
         )
-      if not config.return_logprobs:
+      if self.algo_config.use_rollout_logps and not config.return_logprobs:
         raise ValueError(
             f"RolloutConfig ({mode}) must have return_logprobs=True for "
-            "AgenticRLLearner. Please set this before initializing RLCluster."
+            "AgenticRLLearner when use_rollout_logps=True. Please set this "
+            "before initializing RLCluster."
         )
       if (
           self.rl_cluster.cluster_config.rollout_engine == "vllm"
@@ -412,8 +414,6 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
           )
       if "pair_index" in env.extra_kwargs:
         tags[perf_constants.PAIR_INDEX] = env.extra_kwargs["pair_index"]
-
-
 
     result = self.rl_cluster.generate(
         prompts=chat_lists,
