@@ -168,29 +168,92 @@ class AccGrad(nnx.Variable):
   pass
 
 
-class GradientAccumulator(nnx.Module):
-  """Accumulates gradients manually."""
+class AccDenom(nnx.Variable):
+  """Scalar accumulator slot for the loss-aggregation denominator.
 
-  def __init__(self, model: nnx.Module, wrt: Any):
+  Kept separate from `AccGrad` so the sharding pass can treat the scalar
+  denominator as fully replicated while sharding the grad pytree according
+  to the model's parameter partition spec.
+  """
+
+  pass
+
+
+class GradientAccumulator(nnx.Module):
+  """Accumulates gradients manually.
+
+  Two modes are supported:
+
+  1. Unweighted (``denom_aware=False``, the default and the original
+     behavior). ``add(grads)`` accumulates ``acc_grads += grads`` and
+     ``get()`` returns ``Σ_i grads_i``. Suitable when each micro-batch's
+     gradient already represents the desired contribution (e.g., when the
+     loss function returns a per-batch scalar mean).
+  2. Denom-aware (``denom_aware=True``). ``add(grads, denom)`` accumulates
+     both ``acc_grads += grads`` (where ``grads`` are gradients of an
+     unreduced loss sum) and ``acc_denom += denom``. ``get()`` returns
+     ``Σ_i grads_i / max(Σ_i denom_i, 1)``. This is the mathematically
+     correct accumulation when micro-batches have varying loss
+     denominators — for example, sequence packing produces micro-batches
+     with varying numbers of active segments / tokens per step. The
+     "pre-scale grads by 1/denom then average over K micro-batches" pattern
+     is *only* correct when all ``denom_i`` are equal; the denom-aware path
+     removes that constraint.
+
+  See ``SEQUENCE_PACKING_PLAN.md`` §1.4 for the derivation. The unweighted
+  path is preserved so callers whose loss function returns a per-batch
+  scalar (i.e., does not expose a denominator) continue to work unchanged.
+  """
+
+  def __init__(
+      self,
+      model: nnx.Module,
+      wrt: Any,
+      denom_aware: bool = False,
+  ):
     state = nnx.state(model, wrt)
     self.grads = jax.tree_util.tree_map(
         lambda x: AccGrad(jnp.zeros_like(x)), state
     )
+    self.denom_aware = denom_aware
+    if denom_aware:
+      self.denom = AccDenom(jnp.zeros((), dtype=jnp.float32))
 
-  def add(self, grads: Any):
+  def add(self, grads: Any, denom: jax.Array | None = None):
     def _add(acc, g):
       acc.value = acc.value + g
 
     jax.tree_util.tree_map(_add, self.grads, grads)
 
+    if self.denom_aware:
+      if denom is None:
+        raise ValueError(
+            "GradientAccumulator was constructed with denom_aware=True; "
+            "add() requires a `denom` argument."
+        )
+      self.denom.value = self.denom.value + denom.astype(jnp.float32)
+    elif denom is not None:
+      raise ValueError(
+          "GradientAccumulator was constructed with denom_aware=False; "
+          "add() received an unexpected `denom` argument. Pass "
+          "denom_aware=True at construction to enable denom-aware "
+          "accumulation."
+      )
+
   def get(self):
-    return jax.tree_util.tree_map(lambda x: x.value, self.grads)
+    raw = jax.tree_util.tree_map(lambda x: x.value, self.grads)
+    if self.denom_aware:
+      scale = 1.0 / jnp.maximum(self.denom.value, jnp.asarray(1.0, jnp.float32))
+      return jax.tree_util.tree_map(lambda g: g * scale, raw)
+    return raw
 
   def reset(self):
     def _reset(acc):
       acc.value = jnp.zeros_like(acc.value)
 
     jax.tree_util.tree_map(_reset, self.grads)
+    if self.denom_aware:
+      self.denom.value = jnp.zeros_like(self.denom.value)
 
 
 class PeftTrainer:
@@ -449,6 +512,14 @@ class PeftTrainer:
         accumulator_state, model_pspecs
     )
     nnx.update(self.grad_accumulator, accumulator_sharded_state)
+
+    if self.grad_accumulator.denom_aware:
+      denom_state = nnx.state(self.grad_accumulator, AccDenom)
+      denom_pspecs = nnx.get_partition_spec(denom_state)
+      denom_sharded_state = jax.lax.with_sharding_constraint(
+          denom_state, denom_pspecs
+      )
+      nnx.update(self.grad_accumulator, denom_sharded_state)
 
   def jit_train_and_eval_step(
       self, skip_jit: bool = False, cache_nnx_graph: bool = False

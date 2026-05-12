@@ -653,5 +653,128 @@ class PeftTrainerTest(parameterized.TestCase):
     )
 
 
+class GradientAccumulatorTest(parameterized.TestCase):
+  """Unit tests for the GradientAccumulator module.
+
+  Focused on the denom-aware path: under varying-denominator micro-batches,
+  the accumulated gradient must match the gradient of the equivalent
+  single-step batch. The non-denom-aware path preserves the original sum
+  semantics.
+  """
+
+  def _make_accumulator(self, denom_aware: bool):
+    rngs = nnx.Rngs(0)
+    model = nnx.Linear(in_features=4, out_features=2, rngs=rngs)
+    return model, peft_trainer.GradientAccumulator(
+        model, nnx.Param, denom_aware=denom_aware
+    )
+
+  def _ones_like_params(self, model, scale: float = 1.0):
+    return jax.tree_util.tree_map(
+        lambda x: jnp.asarray(scale, dtype=x.value.dtype)
+        * jnp.ones_like(x.value),
+        nnx.state(model, nnx.Param),
+    )
+
+  def test_unweighted_mode_sums_grads(self):
+    """Default (denom_aware=False) preserves the existing Σ_i grads behavior."""
+    model, acc = self._make_accumulator(denom_aware=False)
+    acc.add(self._ones_like_params(model, scale=1.0))
+    acc.add(self._ones_like_params(model, scale=2.0))
+    out = acc.get()
+    jax.tree_util.tree_map(
+        lambda v: np.testing.assert_allclose(v, 3.0 * jnp.ones_like(v)), out
+    )
+
+  def test_unweighted_mode_rejects_denom(self):
+    model, acc = self._make_accumulator(denom_aware=False)
+    grads = self._ones_like_params(model)
+    with self.assertRaisesRegex(ValueError, 'denom_aware=False'):
+      acc.add(grads, denom=jnp.asarray(2.0))
+
+  def test_denom_aware_mode_requires_denom(self):
+    model, acc = self._make_accumulator(denom_aware=True)
+    grads = self._ones_like_params(model)
+    with self.assertRaisesRegex(ValueError, 'requires a `denom`'):
+      acc.add(grads)
+
+  @parameterized.named_parameters(
+      dict(testcase_name='equal_denoms', denoms=(4.0, 4.0, 4.0, 4.0)),
+      dict(testcase_name='varying_denoms', denoms=(1.0, 7.0, 3.0, 5.0)),
+      dict(testcase_name='extreme_variance', denoms=(1.0, 1.0, 100.0, 1.0)),
+  )
+  def test_denom_aware_matches_single_step_baseline(self, denoms):
+    """The denom-aware accumulator matches the equivalent single-step batch.
+
+    Setup: K micro-batches with denominator d_i and unreduced-sum
+    gradient g_i. The accumulator computes ``Σ_i g_i / Σ_i d_i``, which is
+    ``grad(Σ_i loss_unreduced_i) / Σ_i d_i`` — i.e., a single step on the
+    concatenated batch — for any choice of d_i. The "pre-scale grads by
+    1/d_i then mean over K" pattern fails this equality when d_i are
+    unequal; this test guards against that regression.
+    """
+    model, acc = self._make_accumulator(denom_aware=True)
+
+    keys = jax.random.split(jax.random.PRNGKey(0), len(denoms))
+    grads = [
+        jax.tree_util.tree_map(
+            lambda x, k=k: jax.random.normal(
+                k, x.value.shape, dtype=x.value.dtype
+            ),
+            nnx.state(model, nnx.Param),
+        )
+        for k in keys
+    ]
+
+    for g_i, d_i in zip(grads, denoms):
+      acc.add(g_i, denom=jnp.asarray(d_i, dtype=jnp.float32))
+    accumulated = acc.get()
+
+    total_denom = sum(denoms)
+    expected = jax.tree_util.tree_map(
+        lambda *gs: sum(gs) / total_denom, *grads
+    )
+    jax.tree_util.tree_map(
+        lambda a, e: np.testing.assert_allclose(a, e, rtol=1e-6, atol=1e-6),
+        accumulated,
+        expected,
+    )
+
+    if len(set(denoms)) > 1:
+      naive_mean = jax.tree_util.tree_map(
+          lambda *gs: sum(g / d for g, d in zip(gs, denoms)) / len(gs),
+          *grads,
+      )
+      diff_tree = jax.tree_util.tree_map(
+          lambda a, b: jnp.max(jnp.abs(a - b)), accumulated, naive_mean
+      )
+      max_naive_diff = jax.tree_util.tree_reduce(
+          jnp.maximum, diff_tree, initializer=jnp.asarray(0.0, jnp.float32)
+      )
+      self.assertGreater(
+          float(max_naive_diff),
+          1e-3,
+          msg=(
+              'naive pre-scale-then-mean and Sigma g / Sigma d should '
+              'disagree when denominators vary; if they agree the test setup '
+              'is degenerate.'
+          ),
+      )
+
+  def test_reset_clears_denom(self):
+    model, acc = self._make_accumulator(denom_aware=True)
+    acc.add(
+        self._ones_like_params(model), denom=jnp.asarray(7.0, jnp.float32)
+    )
+    acc.reset()
+    self.assertEqual(float(acc.denom.value), 0.0)
+    jax.tree_util.tree_map(
+        lambda x: np.testing.assert_array_equal(
+            x.value, jnp.zeros_like(x.value)
+        ),
+        acc.grads,
+    )
+
+
 if __name__ == '__main__':
   absltest.main()
