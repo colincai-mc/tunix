@@ -25,6 +25,8 @@ RUN pip install git+https://github.com/ayaka14732/jax-smi.git
 # RUN pip install git+https://github.com/AI-Hypercomputer/pathways-utils.git@b72729bb152b7b3426299405950b3af300d765a9#egg=pathwaysutils
 RUN pip install gcsfs
 RUN pip install wandb
+# gymnasium is needed by examples/frozenlake/env.py (not pulled in by base deps).
+RUN pip install gymnasium
 
 # Set the working directory
 WORKDIR /app
