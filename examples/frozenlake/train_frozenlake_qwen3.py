@@ -21,6 +21,13 @@ unchanged on any spot VM:
                         vLLM server avoids the trace-context issues of running
                         the in-process sampler under REMAT and offers higher
                         throughput at full concurrency).
+  MODEL_DTYPE           "bf16" (default) | "fp32" — storage/compute dtype for
+                        the reference policy and trainer forward path.
+  MIX_PRECISION         "1" (default) | "0" — when 0, runs the model in fp32
+                        end-to-end (set together with MODEL_DTYPE=fp32).
+  FLASH_ATTN            "1" (default) | "0" — splash flash attention kernel.
+  TRAIN_MICRO_BS        Trainer forward+backward micro-batch (default 4).
+  COMPUTE_LOGPS_MICRO_BS  Logp recomputation micro-batch (default 4).
 """
 
 import contextlib
@@ -131,14 +138,14 @@ arg_parser.add_argument("--temperature", type=float, default=0.7)
 # comparable; exploration can be controlled via temperature.
 arg_parser.add_argument("--top_p", type=float, default=1.0)
 arg_parser.add_argument("--top_k", type=int, default=0)
-# Concurrent rollout threads. Higher values let more trajectories generate
-# in parallel; the vLLM engine batches them efficiently as long as KV-cache
-# headroom remains. With engine-disagg rollout (vLLM server) there is no
-# pjit-dispatch race with the trainer, so all `full_batch_size *
-# num_generations` trajectories can be in flight at once. A high cap also lets
-# every multi-turn agent step its env without waiting for a previous wave to
-# drain. Drop only if KV cache saturates or generation throughput regresses.
-arg_parser.add_argument("--max_concurrency", type=int, default=512)
+# Concurrent rollout threads. Should stay at or below the vLLM engine's
+# `max_num_seqs` (default 64) plus a small backlog; pushing it much higher
+# pegs the KV cache at 100% and forces chunked-prefill to interleave with
+# decode, which makes the sampler's logits diverge from the trainer's
+# recomputation (visible as a large `sampler_trainer/train/logp_diff_mean`)
+# and noticeably degrades steady-state reward. Keep ~4x `max_num_seqs` so the
+# engine has work queued without saturating the cache.
+arg_parser.add_argument("--max_concurrency", type=int, default=256)
 arg_parser.add_argument("--shuffle_data", type=bool, default=True)
 arg_parser.add_argument("--seed", type=int, default=42)
 arg_parser.add_argument(
@@ -202,18 +209,17 @@ ENABLE_REMAT = True
 # in via per-position segment ids. The model now plumbs segment ids derived
 # from the non-pad mask into splash, so left-padded prompts no longer
 # contaminate real-token attention outputs.
-ENABLE_FLASH_ATTENTION = True
-ENABLE_MIX_PRECISION = True
+ENABLE_FLASH_ATTENTION = os.environ.get("FLASH_ATTN", "1") not in ("0", "false", "False")
+ENABLE_MIX_PRECISION = os.environ.get("MIX_PRECISION", "1") not in ("0", "false", "False")
 BATCH_SIZE = args.batch_size
 MINI_BATCH_SIZE = args.mini_batch_size
 NUM_BATCHES = args.num_batches
 # Held-out eval pool size in batches. The frozenlake test set ships with 100
-# prompts; with BATCH_SIZE=8 a value of 13 covers one full pass per eval.
-# Each eval pass runs NUM_TEST_BATCHES * BATCH_SIZE prompts * num_generations
-# rollouts, so eval wall-time scales linearly. If you change BATCH_SIZE,
-# adjust this so that NUM_TEST_BATCHES * BATCH_SIZE >= test set size to
-# evaluate the full held-out set once per eval.
-NUM_TEST_BATCHES = 13
+# prompts; NUM_TEST_BATCHES * BATCH_SIZE should be >= 100 to cover one full
+# pass per eval. With the default BATCH_SIZE=64, NUM_TEST_BATCHES=2 is
+# sufficient. Eval wall-time scales linearly with NUM_TEST_BATCHES *
+# BATCH_SIZE * num_generations.
+NUM_TEST_BATCHES = 2
 
 EVAL_EVERY_N_STEPS = 10
 NUM_EPOCHS = 3
@@ -221,7 +227,9 @@ MAX_STEPS = int(NUM_BATCHES * NUM_ITERATIONS * TRAIN_FRACTION * NUM_EPOCHS)
 
 MAX_CONCURRENCY = args.max_concurrency
 OFF_POLICY_STEPS = 0
-MODEL_DTYPE = jnp.bfloat16
+MODEL_DTYPE = {"bf16": jnp.bfloat16, "bfloat16": jnp.bfloat16, "fp32": jnp.float32, "float32": jnp.float32}[
+    os.environ.get("MODEL_DTYPE", "bf16").lower()
+]
 
 LEARNING_RATE = args.learning_rate
 B1 = args.b1
@@ -442,7 +450,7 @@ vllm_rollout_dict = {
     # max_seq_len rather than the vLLM default. Once vLLM-TPU gains support
     # for sleep/wake_up, this can be relaxed since the KV pool can be
     # offloaded to host RAM during train_step.
-    "rollout_vllm_hbm_utilization": 0.20,
+    "rollout_vllm_hbm_utilization": float(os.environ.get("VLLM_HBM_UTIL", "0.20")),
     "rollout_vllm_tpu_backend_type": "jax",
     "rollout_vllm_server_mode": True,
     # Async scheduling adds an extra in-flight step that can race weight sync;
@@ -494,18 +502,12 @@ cluster_config = rl_cluster_lib.ClusterConfig(
         # ``train_micro_batch_size`` and accumulates gradients across
         # ``mini_batch_size // train_micro_batch_size`` chunks before stepping.
         # Reducing this lowers peak HBM (the lm_head logits tensor
-        # ``[micro_batch, seq_len, vocab/TP]`` is the dominant allocation) at
-        # the cost of more micro-step launches per optimizer update. It does
-        # NOT change the effective optimizer batch size or training dynamics.
-        # Memory-shaping micro-batch for forward+backward. Forward+backward
-        # produces an ``[micro_batch * num_gen * seq_len, vocab/TP]`` logits
-        # tensor in fp32; on small TPU slices this is the dominant allocation.
-        # With agentic outer-loop chunking applied below, each outer iter
-        # invokes the trainer ``mini_batch_size // train_micro_batch_size``
-        # times, so the optimizer still sees a ``mini_batch_size`` gradient
-        # per update.
-        train_micro_batch_size=4,
-        compute_logps_micro_batch_size=4,
+        # ``[micro_batch * num_gen * seq_len, vocab/TP]`` in fp32 is the
+        # dominant allocation on small TPU slices) at the cost of more
+        # micro-step launches per optimizer update. It does NOT change the
+        # effective optimizer batch size or training dynamics.
+        train_micro_batch_size=int(os.environ.get("TRAIN_MICRO_BS", 4)),
+        compute_logps_micro_batch_size=int(os.environ.get("COMPUTE_LOGPS_MICRO_BS", 4)),
         metrics_logging_options=metrics_logging_options,
         checkpoint_root_directory=CKPT_DIR,
         checkpointing_options=checkpointing_options,
