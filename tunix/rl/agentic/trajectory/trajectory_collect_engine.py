@@ -62,6 +62,7 @@ class TrajectoryCollectEngine:
       model_call_kwargs: Optional[Dict[str, Any]] = None,
       gamma: float = 1.0,
       max_response_length: Optional[int] = None,
+      max_prompt_length: Optional[int] = None,
       timeout: float = 600.0,
       tokenizer=None,
       chat_parser=None,
@@ -109,6 +110,7 @@ class TrajectoryCollectEngine:
     self.max_steps = getattr(self.env, "max_steps", 1)
     self.gamma = gamma
     self.max_response_length = max_response_length
+    self.max_prompt_length = max_prompt_length
     self._response_token_count = 0
     self.timeout = timeout
 
@@ -353,6 +355,7 @@ class TrajectoryCollectEngine:
       gamma: float = 1.0,
       timeout: float = 30.0,
       max_response_length: Optional[int] = None,
+      max_prompt_length: Optional[int] = None,
       mode: str = "Trajectory",
       filter_statuses: Optional[Set[agent_types.TrajectoryStatus]] = None,
       overlong_filter: bool = True,
@@ -391,6 +394,7 @@ class TrajectoryCollectEngine:
           model_call=model_call,
           gamma=gamma,
           max_response_length=max_response_length,
+          max_prompt_length=max_prompt_length,
           timeout=timeout,
           filter_statuses=filter_statuses,
           overlong_filter=overlong_filter,
@@ -471,7 +475,17 @@ class TrajectoryCollectEngine:
     return tags
 
   def _check_and_set_context_limit_reached(self) -> bool:
-    """Returns True and updates trajectory status if response budget is exhausted."""
+    """Returns True and updates trajectory status if the response budget is
+    exhausted or the accumulated prompt would exceed ``max_prompt_length``.
+
+    The prompt-length check covers multi-turn agentic rollouts where the
+    active prompt grows each turn. Without it, the sampler eventually receives
+    a prompt longer than ``max_prompt_length`` and either rounds up to
+    ``next_power_of_2`` (causing train_step shape recompiles) or raises
+    ``ValueError: Total sampling steps ... must be less than the cache size``.
+    Terminating here marks the trajectory ``MAX_CONTEXT_LIMIT_REACHED`` so the
+    overlong filter masks it out, instead of crashing the rollout worker.
+    """
     if (
         self.max_response_length is not None
         and self._response_token_count >= self.max_response_length
@@ -481,6 +495,36 @@ class TrajectoryCollectEngine:
       )
       logging.debug("%s MAX_CONTEXT_LIMIT_REACHED", self._debug_prefix)
       return True
+    if (
+        self.max_prompt_length is not None
+        and self.tokenizer is not None
+        and self.chat_parser is not None
+    ):
+      prompt_str = self.chat_parser.parse(
+          self.agent.chat_completions,
+          add_generation_prompt=True,
+          is_first_msg=True,
+      )
+      # Match the sampler's tokenization (``tokenizer.encode`` with default
+      # ``add_special_tokens=True``) so the check's prompt length agrees with
+      # the length the sampler will see — otherwise the chat-template special
+      # tokens are re-split into BPE pieces here, undercounting by a few-token
+      # margin per turn and letting prompts that the sampler then rounds up
+      # past ``next_power_of_2(max_prompt_length)`` slip past the check.
+      prompt_len = len(self.tokenizer.encode(prompt_str))
+      logging.debug(
+          "%s prompt_check prompt_len=%d max_prompt_length=%d",
+          self._debug_prefix, prompt_len, self.max_prompt_length,
+      )
+      if prompt_len >= self.max_prompt_length:
+        self.agent.trajectory.status = (
+            agent_types.TrajectoryStatus.MAX_CONTEXT_LIMIT_REACHED
+        )
+        logging.debug(
+            "%s MAX_CONTEXT_LIMIT_REACHED prompt_len=%d >= max_prompt_length=%d",
+            self._debug_prefix, prompt_len, self.max_prompt_length,
+        )
+        return True
     return False
 
   async def _one_step(self) -> bool:

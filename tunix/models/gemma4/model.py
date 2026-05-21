@@ -1106,7 +1106,14 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       positions=None,
       cache=None,
       attention_mask=None,
+      segment_ids=None,
   ):
+    # `segment_ids` is accepted for compatibility with the RL training path,
+    # which forwards a per-position non-pad mask (or packed document ids) to
+    # every model. Non-packed FrozenLake runs do not need it: `attention_mask`
+    # already encodes padding. If future Gemma4 use cases require packed-mode
+    # boundary enforcement, thread `segment_ids` into the per-layer attention.
+    del segment_ids
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))

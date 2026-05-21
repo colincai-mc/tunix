@@ -468,12 +468,18 @@ class AgenticRLLearner(abc.ABC, Generic[TConfig]):
 
   def _build_orchestrator(self) -> rollout_orchestrator.RolloutOrchestrator:
     """Builds and configures a RolloutOrchestrator for parallel rollouts."""
+    rollout_config = self.rl_cluster.cluster_config.rollout_config
+    if isinstance(rollout_config, dict):
+      _train_cfg = rollout_config.get("train") or next(iter(rollout_config.values()))
+    else:
+      _train_cfg = rollout_config
     engine_kwargs = dict(
         model_call=self._model_call,
         tokenizer=self.tokenizer,
         chat_parser=self.chat_parser,
         timeout=self.algo_config.episode_timeout,
         max_response_length=self.algo_config.max_response_length,
+        max_prompt_length=getattr(_train_cfg, "max_prompt_length", None),
         overlong_filter=self.algo_config.overlong_filter,
         filter_statuses=self.algo_config.filter_statuses,
         perf_v2=self.rl_cluster.perf_v2,

@@ -240,7 +240,11 @@ class GemmaChatTemplateParser(BaseChatTemplateParser):
     )
 
   def _parse_assistant(self, content: str) -> str:
-    return self.tokens.assistant_token + content
+    # Gemma's standard chat template ends every turn — including assistant —
+    # with `<end_of_turn>\n`. Omitting it leaves multi-turn rollouts with
+    # malformed inter-message boundaries (no separator between assistant and
+    # the next user/tool turn), which biases trainer logp recomputation.
+    return self.tokens.assistant_token + content + self.tokens.eot_token
 
   def _parse_system(self, content: str) -> str:
     # This should not be called if parse() is used, as it handles the system

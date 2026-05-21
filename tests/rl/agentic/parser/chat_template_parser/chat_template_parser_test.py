@@ -188,6 +188,22 @@ class GemmaChatTemplateParserTest(absltest.TestCase):
       # that might bypass the preprocessing in parse().
       self.parser._parse_message(message)
 
+  def test_parse_assistant_appends_end_of_turn(self):
+    # The standard Gemma chat template ends every turn — including
+    # assistant — with `<end_of_turn>\n`. Without it, multi-turn rollouts
+    # have no separator between assistant and the next user/tool turn.
+    rendered = self.parser._parse_assistant('hello')
+    self.assertEqual(rendered, '<start_of_turn>model\nhello<end_of_turn>\n')
+
+  def test_parse_multi_turn_has_assistant_end_of_turn(self):
+    messages = [
+        {'role': 'user', 'content': 'q1'},
+        {'role': 'assistant', 'content': 'a1'},
+        {'role': 'user', 'content': 'q2'},
+    ]
+    rendered = self.parser.parse(messages)
+    self.assertIn('a1<end_of_turn>\n<start_of_turn>user\nq2', rendered)
+
 
 if __name__ == '__main__':
   absltest.main()
