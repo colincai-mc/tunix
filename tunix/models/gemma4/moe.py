@@ -185,9 +185,9 @@ class MoERagged(nnx.Module):
     )
     return out
 
-  def __call__(self, x):
-    var = jnp.mean(jnp.square(x.astype(jnp.float32)), axis=-1, keepdims=True)
-    router_input = x * jax.lax.rsqrt(var + 1e-06).astype(x.dtype)
+  def __call__(self, router_x, expert_x):
+    var = jnp.mean(jnp.square(router_x.astype(jnp.float32)), axis=-1, keepdims=True)
+    router_input = router_x * jax.lax.rsqrt(var + 1e-06).astype(router_x.dtype)
 
     root_size = jax.lax.rsqrt(
         jnp.array(self.features, dtype=router_input.dtype)
@@ -203,5 +203,5 @@ class MoERagged(nnx.Module):
         self.router_logits.value.astype(router_input.dtype),
     )
     weights, choices = self._router(logits)
-    out = self._run_ffw_and_routing(x, choices, weights)
+    out = self._run_ffw_and_routing(expert_x, choices, weights)
     return out

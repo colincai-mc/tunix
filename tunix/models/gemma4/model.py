@@ -1049,7 +1049,7 @@ class DecoderLayer(nnx.Module):
     if self.config.enable_moe:
       ffw = self.dense_post_ffw_norm(ffw)
       moe_norm_ffw = self.moe_pre_ffw_norm(attn)
-      moe_out = self.moe(moe_norm_ffw)
+      moe_out = self.moe(attn, moe_norm_ffw)
       moe_out = self.moe_post_ffw_norm(moe_out)
       ffw += moe_out
     ffw = self.post_ffw_norm(ffw)
@@ -1150,7 +1150,9 @@ class Gemma4(BackendMappingMixin, nnx.Module):
       positions=None,
       cache=None,
       attention_mask=None,
+      segment_ids=None,
   ):
+    del segment_ids  # accepted for trainer compat; padding lives in attention_mask
     if positions is None:
       B, T = tokens.shape  # pylint: disable=invalid-name
       positions = jnp.tile(jnp.arange(T)[None, :], (B, 1))
@@ -1204,3 +1206,19 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     for i, layer in enumerate(self.layers):
       cache[f'layer_{i}'] = layer.init_cache(batch_size, max_seq_len, dtype)
     return cache
+
+  def get_model_input(self):
+    dummy_batch_size = 2
+    dummy_seq_len = 1
+    return {
+        'tokens': jnp.ones(
+            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
+        ),
+        'positions': jnp.ones(
+            (dummy_batch_size, dummy_seq_len), dtype=jnp.int32
+        ),
+        'cache': None,
+        'attention_mask': jnp.ones(
+            (dummy_batch_size, dummy_seq_len, dummy_seq_len), dtype=jnp.bool
+        ),
+    }
