@@ -119,8 +119,10 @@ def sample_top_p(
   # Upcast to float32 for numerical stability of softmax and subsequent cumsum.
   next_token_logits = logits[:, -1].astype(jnp.float32) / temperature
 
+  # top_k=0 or None both mean "no top-k filtering" — use full vocabulary.
+  _no_topk = top_k is None or top_k <= 0
   # Skip softmax and sorting if top_p is 1.0 and top_k is full vocab.
-  if top_p >= 1.0 and top_k is None:
+  if top_p >= 1.0 and _no_topk:
     next_token = jax.random.categorical(key, logits=next_token_logits)
     if not return_logprobs:
       return next_token, None
@@ -130,7 +132,7 @@ def sample_top_p(
     return next_token, logp_sampled
 
   probs = jax.nn.softmax(next_token_logits, axis=-1)
-  k = probs.shape[-1] if top_k is None else top_k
+  k = probs.shape[-1] if _no_topk else top_k
 
   probs_sorted, indices = jax.lax.top_k(probs, k=k)
   cumsum_probs = jnp.cumsum(probs_sorted, axis=-1)
@@ -783,10 +785,8 @@ class Sampler(base_sampler.BaseSampler):
       processed_images = jnp.array(processed_images)
 
     max_tokens_length = max(len(x) for x in tokens)
-    print(f'Max prompt length (in tokens): {max_prompt_length}')
     if max_prompt_length is None or max_prompt_length < max_tokens_length:
       max_prompt_length = utils.next_power_of_2(max_tokens_length)
-    print(f'Using max_prompt_length={max_prompt_length} for sampling.')
 
     all_input_ids = np.array([
         utils.pad_to_length(

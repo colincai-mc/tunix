@@ -1160,6 +1160,25 @@ class Gemma4(BackendMappingMixin, nnx.Module):
     new_cache = None if cache is None else {}
     x = self.embedder.encode(tokens)
 
+    # >>> DIAG-LOGP-UNIFORM <<<
+    import os as _os
+    _diag = _os.environ.get("DEBUG_LOGITS", "0") not in ("0", "false", "False")
+    if _diag:
+      _emb_w = self.embedder.input_embedding.value
+      jax.debug.print(
+          "DIAG-MODEL embed_w[mean,std,min,max]=[{a},{b},{c},{d}] embed_w[0,:5]={e}"
+          " post_encode_x[mean,std]=[{f},{g}] x[0,0,:5]={h}",
+          a=jnp.mean(_emb_w.astype(jnp.float32)),
+          b=jnp.std(_emb_w.astype(jnp.float32)),
+          c=jnp.min(_emb_w.astype(jnp.float32)),
+          d=jnp.max(_emb_w.astype(jnp.float32)),
+          e=_emb_w[0, :5],
+          f=jnp.mean(x.astype(jnp.float32)),
+          g=jnp.std(x.astype(jnp.float32)),
+          h=x[0, 0, :5],
+      )
+    # >>> END DIAG <<<
+
     per_layer_inputs = None
     if self.config.per_layer_input_dim > 0:
       per_layer_inputs = self.embedder.encode_per_layer_input(x, tokens)
@@ -1189,11 +1208,53 @@ class Gemma4(BackendMappingMixin, nnx.Module):
           kv_shared_cache=kv_shared_cache,
       )
 
+      if _diag and i in (0, 1, 5, 14, 29):
+        jax.debug.print(
+            "DIAG-MODEL after_layer_{i} x[mean,std,max,min]=[{a},{b},{c},{d}] x[0,0,:5]={e}",
+            i=i,
+            a=jnp.mean(x.astype(jnp.float32)),
+            b=jnp.std(x.astype(jnp.float32)),
+            c=jnp.max(x.astype(jnp.float32)),
+            d=jnp.min(x.astype(jnp.float32)),
+            e=x[0, 0, :5],
+        )
+
       if new_cache is not None:
         new_cache[layer_name] = layer_cache  # pytype: disable=container-type-mismatch
 
+    if _diag:
+      jax.debug.print(
+          "DIAG-MODEL pre_final_norm_x[mean,std]=[{a},{b}] x[0,0,:5]={c}",
+          a=jnp.mean(x.astype(jnp.float32)),
+          b=jnp.std(x.astype(jnp.float32)),
+          c=x[0, 0, :5],
+      )
+
     x = self.final_norm(x)
+
+    if _diag:
+      _fn_w = self.final_norm.scale.value
+      jax.debug.print(
+          "DIAG-MODEL final_norm_scale[mean,std]=[{a},{b}]"
+          " post_final_norm_x[mean,std]=[{c},{d}] x[0,0,:5]={e}",
+          a=jnp.mean(_fn_w.astype(jnp.float32)),
+          b=jnp.std(_fn_w.astype(jnp.float32)),
+          c=jnp.mean(x.astype(jnp.float32)),
+          d=jnp.std(x.astype(jnp.float32)),
+          e=x[0, 0, :5],
+      )
+
     logits = self.embedder.decode(x).astype(jnp.float32)
+
+    if _diag:
+      jax.debug.print(
+          "DIAG-MODEL pre_softcap_logits[mean,std,max,min]=[{a},{b},{c},{d}] logits[0,0,:5]={e}",
+          a=jnp.mean(logits),
+          b=jnp.std(logits),
+          c=jnp.max(logits),
+          d=jnp.min(logits),
+          e=logits[0, 0, :5],
+      )
 
     if self.config.final_logit_softcap is not None:
       logits /= self.config.final_logit_softcap

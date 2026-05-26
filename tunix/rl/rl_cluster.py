@@ -849,6 +849,13 @@ class RLCluster:
         self._log_metrics(m)
 
   def update_actor(self, train_ds, eval_ds, skip_jit=False):
+    if os.environ.get("FORWARD_ONLY_VERIFICATION", "0") not in (
+        "0", "false", "False"
+    ):
+      # Skip the train_step JIT compile (which reserves ~50G for gradient
+      # buffers). FORWARD_ONLY_VERIFICATION only needs rollout + compute_logps
+      # to measure sampler-trainer numeric agreement; no parameter updates.
+      return
     with self._get_mesh_and_logical_axis_rules_cm(Role.ACTOR):
       self._maybe_load_model_from_cpu(self.actor_trainer.model, Role.ACTOR)
       with self._perf.span_group("actor_training"):

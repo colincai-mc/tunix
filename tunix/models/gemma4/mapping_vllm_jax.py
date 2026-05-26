@@ -129,8 +129,11 @@ def preprocess_src_state(src_state: Any) -> Any:
     flat_state = list(src_state.flat_state())
     new_flat_state = []
     for keys, param in flat_state:
-      src_key = '.'.join(str(k) for k in keys)
-      if 'attn.kv_einsum.w' in src_key:
+      # Only split the base kv_einsum weight (keys ending in ('kv_einsum', 'w')).
+      # Substring matching would also catch LoRA params ('w_lora_a', 'w_lora_b'),
+      # which would collide on the rewritten ('k_einsum', 'w') / ('v_einsum', 'w')
+      # keys and silently drop weights via last-write-wins.
+      if len(keys) >= 2 and tuple(str(k) for k in keys[-2:]) == ('kv_einsum', 'w'):
         val = param.value if hasattr(param, 'value') else param
         k_val = val[0]
         v_val = val[1]
@@ -142,6 +145,20 @@ def preprocess_src_state(src_state: Any) -> Any:
         else:
           new_flat_state.append((k_keys, k_val))
           new_flat_state.append((v_keys, v_val))
+      elif len(keys) >= 2 and tuple(str(k) for k in keys[-2:]) == ('k_einsum', 'w'):
+        # k_eq_v layers (e.g. Gemma4-26B-A4B GLOBAL attention pattern) store
+        # only k_einsum.w because the architectural identity v_proj == k_proj
+        # lets the loader drop v. vLLM's HF-shaped weights still expect a
+        # separate v_proj.weight; without duplicating here, v_proj stays at
+        # whatever the vLLM init produced (random with load_format='dummy'),
+        # corrupting attention on every k_eq_v layer.
+        val = param.value if hasattr(param, 'value') else param
+        v_keys = keys[:-2] + ('v_einsum', 'w')
+        new_flat_state.append((keys, param))
+        if hasattr(param, 'value'):
+          new_flat_state.append((v_keys, nnx.Param(val)))
+        else:
+          new_flat_state.append((v_keys, val))
       else:
         new_flat_state.append((keys, param))
     src_state = src_state.from_flat_path(new_flat_state)

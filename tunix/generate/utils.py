@@ -18,6 +18,7 @@
 from collections import abc
 import functools
 import gc
+import os
 from absl import logging
 import math
 import re
@@ -29,6 +30,64 @@ import jax
 from jax import lax
 import jax.numpy as jnp
 import numpy as np
+
+
+_WEIGHT_DUMP_KEY_FRAGMENTS = (
+    'embedder.input_embedding',
+    'embed_tokens.weight',
+    'layers.0.attn.q_einsum',
+    'layers.0.attn.k_einsum',
+    'layers.5.attn.k_einsum',
+    'layers.5.attn.v_einsum',
+    'layers.0.self_attn.q_proj',
+    'layers.0.self_attn.k_proj',
+    'layers.5.self_attn.k_proj',
+    'layers.5.self_attn.v_proj',
+    'layers.0.mlp.gate_proj',
+    'layers.0.mlp.gate_proj.weight',
+    'layers.0.feed_forward.gating_einsum',
+    'layers.5.moe.gating_einsum',
+    'layers.5.moe.linear',
+    'layers.5.moe.router_logits',
+    'layers.5.moe.router_scale',
+    'layers.5.moe.per_expert_scale',
+    'layers.5.experts.kernel_gating_upproj',
+    'layers.5.experts.kernel_down_proj',
+    'layers.5.router.proj.weight',
+    'layers.5.router.scale',
+    'layers.5.router.per_expert_scale',
+    'layers.0.skip_scale',
+    'layers.0.layer_scalar',
+    'final_norm.scale',
+    'model.norm.weight',
+)
+
+
+def _weight_dump_enabled() -> bool:
+  return os.environ.get('WEIGHT_DUMP', '0') == '1'
+
+
+def _weight_dump_match(name: str) -> bool:
+  if not _weight_dump_enabled():
+    return False
+  return any(frag in name for frag in _WEIGHT_DUMP_KEY_FRAGMENTS)
+
+
+def _weight_dump_stats(name: str, arr: Any, tag: str) -> None:
+  if not _weight_dump_match(name):
+    return
+  try:
+    a = jax.device_get(arr)
+    a = np.asarray(a).astype(np.float32)
+    flat = a.flatten()[:5].tolist()
+    print(
+        f"WEIGHT_DUMP[{tag}] {name}: shape={a.shape} "
+        f"mean={a.mean():.6f} std={a.std():.6f} "
+        f"min={a.min():.4f} max={a.max():.4f} flat[:5]={flat}",
+        flush=True,
+    )
+  except Exception as exc:  # pylint: disable=broad-except
+    print(f"WEIGHT_DUMP[{tag}] {name}: ERROR {exc}", flush=True)
 
 
 def compute_attention_masks(
@@ -841,6 +900,8 @@ def transfer_state_with_mappings(
       val,
       tgt_param,
   ) in unscanned_src_to_tgt_flat.items():
+    _weight_dump_stats(flat_src_key, val, 'src-pre')
+
     # Apply transpose if configured
     val = _apply_transpose(val, flat_src_key, transpose_keys, rollout_engine)
 
@@ -855,6 +916,8 @@ def transfer_state_with_mappings(
 
     # Cast to target dtype
     val = _apply_dtype_cast(val, tgt_param.value.dtype, flat_src_key)
+
+    _weight_dump_stats(flat_src_key, val, f'post-align→{flat_tgt_key}')
 
     # Assign transformed value
     tgt_param.value = val
@@ -894,6 +957,13 @@ def transfer_state_with_mappings(
         tgt_param.value = resharded_values_flat_dict[tgt_key]
       else:
         tgt_param = resharded_values_flat_dict[tgt_key]
+
+  if _weight_dump_enabled():
+    for tgt_key, tgt_param in tgt_flat_list:
+      tgt_path = '.'.join(str(k) for k in tgt_key) if isinstance(tgt_key, tuple) else str(tgt_key)
+      if any(frag in tgt_path for frag in _WEIGHT_DUMP_KEY_FRAGMENTS):
+        val = tgt_param.value if hasattr(tgt_param, 'value') else tgt_param
+        _weight_dump_stats(tgt_path, val, 'tgt-post-reshard')
 
   return dst_state.from_flat_path(tgt_flat_list)
 

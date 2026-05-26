@@ -1,8 +1,41 @@
-# %%
+"""Agentic FrozenLake GRPO recipe for Gemma4-26B-A4B (MoE) on a single host.
 
-# [WIP] Reproduction of [Deepscaler](https://pretty-radio-b75.notion.site/DeepScaleR-Surpassing-O1-Preview-with-a-1-5B-Model-by-Scaling-RL-19681902c1468005bed8ca303013a4e2) with Single-turn Agentic framework.
+This recipe targets a single TPU host (e.g. v5p-8) where actor, reference, and
+rollout share one mesh. Configuration is env-driven so the same image runs
+unchanged on any spot VM:
+
+  HF_TOKEN              Hugging Face token for model download.
+  WANDB_API_KEY         Wandb API key (auto-picked-up by wandb lib).
+  WANDB_PROJECT         Wandb project name (default "tunix-frozenlake").
+  WANDB_RUN_NAME        Wandb run name (default uses timestamp).
+  MODEL_DOWNLOAD_DIR    Local dir for HF safetensors (default
+                        /tmp/models/gemma-4-26B-A4B-it).
+  DATA_DIR              Local or gs:// dir holding train.parquet / test.parquet
+                        (default /tmp/data/frozenlake).
+  CKPT_DIR              Output checkpoint dir. Checkpointing is opt-in; if
+                        unset, no checkpoints are written.
+  TB_LOG_DIR            TensorBoard log dir (default /tmp/tunix-tb/frozenlake).
+  SHARED_MESH_SHAPE     Override the (fsdp, tp) mesh shape. Defaults to
+                        (1, jax.device_count()) (pure tensor parallel).
+  ROLLOUT_ENGINE        "vanilla" | "vllm"  (default "vllm").
+  MODEL_DTYPE           "bf16" (default) | "fp32" — storage/compute dtype for
+                        the reference policy and trainer forward path.
+  MIX_PRECISION         "1" (default) | "0" — when 0, runs the model in fp32
+                        end-to-end (set together with MODEL_DTYPE=fp32).
+  FLASH_ATTN            "1" (default) | "0" — splash flash attention kernel.
+  REMAT                 "block" (default) | "decoder" | "0" — gradient
+                        checkpoint granularity. "block" remats per Attention /
+                        FeedForward (finer-grained, lower peak HBM).
+  ENABLE_THINKING       "0" (default) | "1" — Gemma4 chat-template thinking
+                        channel. Disabled by default so the agent answers
+                        directly without producing internal thoughts that
+                        consume the response budget.
+  TRAIN_MICRO_BS        Trainer forward+backward micro-batch (default 1).
+  COMPUTE_LOGPS_MICRO_BS  Logp recomputation micro-batch (default 1).
+"""
 
 import contextlib
+import datetime
 import logging
 import math
 import os
@@ -16,15 +49,10 @@ import jax
 from jax import numpy as jnp
 import numpy as np
 import optax
-import optax
 from orbax import checkpoint as ocp
 import qwix
 
-# ====== Logging Configuration ======
-# 1. Force absl to use python logging
 absl_logging.use_python_logging()
-
-# 2. Configure the root logger
 logging.basicConfig(
     stream=sys.stdout,
     level=logging.INFO,
@@ -32,70 +60,38 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     force=True,
 )
-
-# 3. Explicitly set levels for relevant loggers
 logging.getLogger().setLevel(logging.INFO)
 logging.getLogger("absl").setLevel(logging.INFO)
-
-# 4. Set absl verbosity
 absl_logging.set_verbosity(absl_logging.INFO)
 absl_logging.set_stderrthreshold("info")
-
 print("Logging configured at INFO level.")
 
+from tunix.models.gemma4 import params_safetensors as params_lib
+from tunix.models.gemma4 import model as model_lib
+from tunix.oss import utils as oss_utils
+from tunix.sft import metrics_logger
+from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
+from tunix.rl.agentic.parser.chat_template_parser import parser
+from tunix.rl import rl_cluster as rl_cluster_lib
+from tunix.rl.rollout import base_rollout
+from tunix.sft import utils as sft_utils
+from tunix.cli.utils import data as data_lib
+from examples.frozenlake.agent import FrozenLakeAgent
+from examples.frozenlake.env import FrozenLakeEnv
+
+_DISTRIBUTED_INITIALIZED = False
 try:
-  from etils import ecolab
-
-  cm = ecolab.adhoc(
-      source=ecolab.FROM_NOTEBOOK_OR_HEAD,
-      reload="tunix",
-      behavior="preferred",
-      cell_autoreload=True,
-  )
-except:
-  import contextlib
-
-  cm = contextlib.nullcontext()
-
-with cm:
-  from tunix.models.gemma4 import params_safetensors as params_lib
-  from tunix.models.gemma4 import model as model_lib
-  from tunix.sft import metrics_logger
-  from tunix.rl.agentic.agentic_grpo_learner import GRPOConfig, GRPOLearner
-  from tunix.rl.agentic.agents import model_agent
-  from tunix.rl.agentic.environments import task_environment
-  from tunix.rl.agentic.trajectory import trajectory_collect_engine
-  from tunix.rl.agentic.parser.chat_template_parser import parser
-  from tunix.rl import rl_cluster as rl_cluster_lib
-  from tunix.rl.rollout import base_rollout
-  from tunix.sft import utils as sft_utils
-  from tunix.utils import math_rewards
-  from tunix.utils import compat
-  from tunix.rl import reshard
-  from tunix.cli.utils import data as data_lib
-  from tunix import PerfMetricsConfig
-  from tunix.perf.experimental.export import PerfMetricsExport
-  from examples.frozenlake.agent import (
-      SYSTEM_PROMPT,
-      MULTI_SHOT_SYSTEM_PROMPT,
-      FrozenLakeAgent,
-  )
-  from examples.frozenlake.env import FrozenLakeEnv
-
-sys.argv.append("--FLAGS_pathways_enforce_subset_devices_form_subslice=false")
-os.environ["FLAGS_pathways_enforce_subset_devices_form_subslice"] = "false"
-try:
-  from absl import flags
-  flags.FLAGS.pathways_enforce_subset_devices_form_subslice = False
+  import pathwaysutils
+  pathwaysutils.initialize()
+  _DISTRIBUTED_INITIALIZED = True
 except Exception:
   pass
 
-try:
-  import pathwaysutils
-
-  pathwaysutils.initialize()
-except:
-  pass
+if not _DISTRIBUTED_INITIALIZED:
+  try:
+    jax.distributed.initialize()
+  except Exception as exc:
+    print(f"jax.distributed.initialize() skipped: {exc}")
 
 print("jax devices: ", jax.devices())
 try:
@@ -107,9 +103,14 @@ except Exception as e:
 # %%
 import argparse
 
-arg_parser = argparse.ArgumentParser(description="Train FrozenLake parameters")
-arg_parser.add_argument("--batch_size", type=int, default=64)
-arg_parser.add_argument("--mini_batch_size", type=int, default=64)
+arg_parser = argparse.ArgumentParser(
+    description="Train FrozenLake on Gemma4-26B-A4B (single-host TPU)."
+)
+# Gemma4-26B-A4B is much larger than Qwen3-8B; keep batch small by default so
+# the debug-run path works on a single v5p-8. Scale up only after the first
+# few steps complete cleanly.
+arg_parser.add_argument("--batch_size", type=int, default=8)
+arg_parser.add_argument("--mini_batch_size", type=int, default=8)
 arg_parser.add_argument("--learning_rate", type=float, default=1e-6)
 arg_parser.add_argument("--b1", type=float, default=0.9)
 arg_parser.add_argument("--b2", type=float, default=0.95)
@@ -126,229 +127,227 @@ arg_parser.add_argument(
 arg_parser.add_argument("--max_prompt_length", type=int, default=2048)
 arg_parser.add_argument("--max_response_length", type=int, default=2048)
 arg_parser.add_argument("--temperature", type=float, default=0.7)
-arg_parser.add_argument("--top_p", type=float, default=1)
-arg_parser.add_argument("--top_k", type=int, default=None)
-arg_parser.add_argument("--max_concurrency", type=int, default=512)
+arg_parser.add_argument("--top_p", type=float, default=1.0)
+arg_parser.add_argument("--top_k", type=int, default=0)
+arg_parser.add_argument("--max_concurrency", type=int, default=64)
 arg_parser.add_argument("--shuffle_data", type=bool, default=True)
-arg_parser.add_argument("--seed", type=int, default=123)
+arg_parser.add_argument("--seed", type=int, default=42)
 arg_parser.add_argument(
     "--loss_agg_mode", type=str, default="sequence-mean-token-mean"
 )
-arg_parser.add_argument(
-    "--kl_loss_mode", type=str, default="low_var_kl"
-)
+arg_parser.add_argument("--kl_loss_mode", type=str, default="low_var_kl")
 arg_parser.add_argument(
     "--advantage_estimator", type=str, default="rloo",
     help="'grpo' (z-score) or 'rloo' (leave-one-out baseline).",
 )
 args, _ = arg_parser.parse_known_args()
 
-# ====== Data ======
 TRAIN_FRACTION = 1.0
-
-# ====== Reproducibility ======
 SEED = args.seed
 
-# ====== LoRA ======
-RANK = 64
-ALPHA = 64.0
-TRAIN_WITH_LORA = False
-
 # ====== Sharding ======
-ROLLOUT_MESH = [(1, 8), ("fsdp", "tp")]
-TRAINER_MESH = [(8, 2), ("fsdp", "tp")]
-REFERENCE_MESH = [(4, 2), ("fsdp", "tp")]
+# Two layouts supported:
+#   1. Shared mesh (default): actor/reference/rollout all live on the same
+#      chips. Works only single-host because vLLM-TPU UniProc shares the JAX
+#      backend in-process. Set via SHARED_MESH_SHAPE.
+#   2. Disjoint meshes (multi-host or when actor+rollout cannot co-locate):
+#      set TRAINER_MESH_SHAPE and ROLLOUT_MESH_SHAPE. Devices are sliced from
+#      jax.devices() so the two meshes never overlap. Reference shares the
+#      trainer mesh unless REFERENCE_MESH_SHAPE is also set.
+_trainer_env = os.getenv("TRAINER_MESH_SHAPE")
+_rollout_env = os.getenv("ROLLOUT_MESH_SHAPE")
+_reference_env = os.getenv("REFERENCE_MESH_SHAPE")
+DISJOINT_MESH = bool(_trainer_env and _rollout_env)
+if DISJOINT_MESH:
+  TRAINER_MESH_SHAPE = tuple(int(x) for x in _trainer_env.split(","))
+  ROLLOUT_MESH_SHAPE = tuple(int(x) for x in _rollout_env.split(","))
+  REFERENCE_MESH_SHAPE = (
+      tuple(int(x) for x in _reference_env.split(",")) if _reference_env else None
+  )
+  SHARED_MESH_SHAPE = None  # not used in disjoint mode
+else:
+  _mesh_env = os.getenv("SHARED_MESH_SHAPE")
+  if _mesh_env:
+    SHARED_MESH_SHAPE = tuple(int(x) for x in _mesh_env.split(","))
+  else:
+    SHARED_MESH_SHAPE = (1, jax.device_count())
+SHARED_MESH_AXIS_NAMES = ("fsdp", "tp")
 
 # ====== GRPO ======
-# === Generation during GRPO training ===
 MAX_PROMPT_LENGTH = args.max_prompt_length
 MAX_RESPONSE_LENGTH = args.max_response_length
-# Important to keep a high-ish temperature for varied, diverse responses during
-# training.
 TEMPERATURE = args.temperature
 TOP_P = args.top_p
 TOP_K = args.top_k
-# The number of times the policy generates multiple responses for a given prompt
-# within a single training step. This corresponds to `G` in Algorithm 1 in the
-# paper. The "group" in GRPO comes from here.
 NUM_GENERATIONS = args.num_generations
 
-# Max number of sequences to be processed in parallel by vllm.
-VLLM_MAX_NUM_SEQS = 512
-
-# Max number of tokens to be processed in parallel by vllm.
-# Divide by 8 for on policy, 1 step off divide by 4
+VLLM_MAX_NUM_SEQS = 64
 VLLM_MAX_BATCHED_TOKENS = VLLM_MAX_NUM_SEQS * 4 * 1024 // 8
 
-# === other GRPO configs ===
-# The number of iterations per batch (𝜇 in GRPO algo 1).
 NUM_ITERATIONS = 1
-# The coefficient for the KL divergence penalty (𝛽) in the GRPO loss function.
-# Important to keep a high enough value for this, otherwise, the KL divergence
-# can increase unchecked.
 BETA = args.beta
-# Epsilon value for clipping (𝜀 in GRPO loss in paper). Similar to PPO, for
-# stable updates.
 EPSILON = args.epsilon
 EPSILON_HIGH = args.epsilon_high
 
 # ====== Training ======
-ENABLE_REMAT = True
-ENABLE_FLASH_ATTENTION = True
-ENABLE_MIX_PRECISION = False
+_REMAT_ENV = os.environ.get("REMAT", "block").lower()
+ENABLE_FLASH_ATTENTION = os.environ.get("FLASH_ATTN", "1") not in ("0", "false", "False")
+ENABLE_MIX_PRECISION = os.environ.get("MIX_PRECISION", "1") not in ("0", "false", "False")
+ENABLE_THINKING = os.environ.get("ENABLE_THINKING", "0") not in ("0", "false", "False")
+# LoRA. When set, the actor is wrapped in qwix LoRA adapters and only the
+# adapters are trained. Lets the full ~26B base stay bf16 (frozen, no
+# precision risk) while keeping a tiny fp32 Adam state on the adapters. The
+# only viable option on memory-bound single-host slices (e.g. v6e-8 ~256GB)
+# for the 26B parameter MoE.
+TRAIN_WITH_LORA = os.environ.get("TRAIN_WITH_LORA", "0") not in ("0", "false", "False")
+LORA_RANK = int(os.environ.get("LORA_RANK", "64"))
+LORA_ALPHA = float(os.environ.get("LORA_ALPHA", "64.0"))
 BATCH_SIZE = args.batch_size
 MINI_BATCH_SIZE = args.mini_batch_size
 NUM_BATCHES = args.num_batches
-# Keep `NUM_TEST_BATCHES` low so that evaluation runs quickly. It can be
-# increased to a max. of 330 (if batch size is 4).
-NUM_TEST_BATCHES = 50
+NUM_TEST_BATCHES = 2
 
-EVAL_EVERY_N_STEPS = 1000  # this doesn't matter if `TRAIN_FRACTION = 1.0`.
-NUM_EPOCHS = 3  # can potentially train for more epochs
-
-# Number of training steps.
+EVAL_EVERY_N_STEPS = 10
+NUM_EPOCHS = 3
 MAX_STEPS = int(NUM_BATCHES * NUM_ITERATIONS * TRAIN_FRACTION * NUM_EPOCHS)
 
-# Max concurrency for parallel processing of trajectories.
 MAX_CONCURRENCY = args.max_concurrency
-
-# Max number of off-policy steps. Default to 0 for synchronous training.
 OFF_POLICY_STEPS = 0
+MODEL_DTYPE = {"bf16": jnp.bfloat16, "bfloat16": jnp.bfloat16, "fp32": jnp.float32, "float32": jnp.float32}[
+    os.environ.get("MODEL_DTYPE", "bf16").lower()
+]
 
-MODEL_DTYPE = jnp.bfloat16
-
-# === AdamW, warmup, cosine scheduler ===
 LEARNING_RATE = args.learning_rate
-B1 = args.b1  # Adam beta1
-B2 = args.b2  # Adam beta2
+B1 = args.b1
+B2 = args.b2
 WEIGHT_DECAY = args.weight_decay
-# == Cosine decay with warmup scheduler ==
-# Linearly increase learning rate from 0. to 5e-6 in the first 10% training
-# steps, and then gradually decrease the learning rate to 0 using cosine
-# scheduler.
 WARMUP_STEPS = 0
-# == Grad clipping ==
-# Grad clipping to prevent large gradients. Found this
-# important to keep KL divergence in check.
 MAX_GRAD_NORM = 100.0
 
 # ====== Checkpoint saving ======
-SAVE_INTERVAL_STEPS = 5
-MAX_TO_KEEP = 500
-DO_MEM_PROFILING = False
+SAVE_INTERVAL_STEPS = 10**9
+MAX_TO_KEEP = 1
 
-# ====== Inference ======
-GENERATION_CONFIGS = {
-    # greedy search
-    "greedy": {"temperature": 1e-4, "top_k": 1, "top_p": 1.0},
-    # some randomness
-    "standard": {"temperature": 0.7, "top_k": 50, "top_p": 0.95},
-    # liberal
-    "liberal": {"temperature": 0.85, "top_k": 2000, "top_p": 1.0},
-}
 # ====== Rollout ======
-ROLLOUT_ENGINE = os.getenv(
-    "ROLLOUT_ENGINE", "vllm"
-)  # one of "vanilla", "vllm" 
+ROLLOUT_ENGINE = os.getenv("ROLLOUT_ENGINE", "vllm")
 
-
-trainer_devices = math.prod(TRAINER_MESH[0])
-rollout_devices = math.prod(ROLLOUT_MESH[0])
-reference_devices = math.prod(REFERENCE_MESH[0])
-
-if trainer_devices + rollout_devices + reference_devices > jax.device_count():
-  raise ValueError(
-      "Trainer devices must be less than or equal to the number of devices"
-      " available."
-  )
-
-
-rollout_device_list = jax._src.mesh_utils.create_device_mesh(
-    ROLLOUT_MESH[0], jax.devices()[:rollout_devices], allow_split_physical_axes=True
-)
-
-rollout_mesh = jax.sharding.Mesh(
-    rollout_device_list,
-    axis_names=ROLLOUT_MESH[1],
-    axis_types=(jax.sharding.AxisType.Auto,) * len(ROLLOUT_MESH[0]),
-)
-print(f"{rollout_device_list=} {rollout_mesh.devices=}")
-reference_device_list = jax._src.mesh_utils.create_device_mesh(
-    REFERENCE_MESH[0], jax.devices()[-reference_devices-trainer_devices:-trainer_devices], allow_split_physical_axes=True
-)
-reference_mesh = jax.sharding.Mesh(
-    reference_device_list,
-    axis_names=REFERENCE_MESH[1],
-    axis_types=(jax.sharding.AxisType.Auto,) * len(REFERENCE_MESH[0]),
-)
-print(f"{reference_device_list=} {reference_mesh.devices=}")
-trainer_device_list = jax._src.mesh_utils.create_device_mesh(
-    TRAINER_MESH[0], jax.devices()[-trainer_devices:], allow_split_physical_axes=True
-)
-trainer_mesh = jax.sharding.Mesh(
-    trainer_device_list,
-    axis_names=TRAINER_MESH[1],
-    axis_types=(jax.sharding.AxisType.Auto,) * len(TRAINER_MESH[0]),
-)
-print(f"{trainer_device_list=} {trainer_mesh.devices=}")
-
-# %%
-try:
-  from GOOGLE_INTERNAL_PACKAGE_PATH.pyglib import gfile
-
-  file_open = gfile.Open
-
-  NOTEBOOK_ENV = "g3"
-except Exception:
-  NOTEBOOK_ENV = "git"
-
-  from google.cloud import storage
-
-  import fsspec
-
-  file_open = fsspec.open
-
-if NOTEBOOK_ENV == "g3":
-  DATA_PATH_PREFIX = "/GOOGLE_INTERNAL_STOAGE_PATH/gg-d/home/qwix-dev/rl/data/"
-  MODEL_PATH_PREFIX = "/GOOGLE_INTERNAL_STOAGE_PATH/gg-d/home/qwix-dev/"
-  CKPT_DIR_PREFIX = "/GOOGLE_INTERNAL_STOAGE_PATH/gg-d/home/qwix-dev/"
+# ====== Paths ======
+# MODEL_VARIANT selects which Gemma4 size to train.
+#   "26b-a4b" (default): Gemma4-26B-A4B MoE instruct
+#   "31b": Gemma4-31B dense instruct
+GEMMA4_VARIANT = os.getenv("GEMMA4_VARIANT", "26b-a4b").lower()
+if GEMMA4_VARIANT == "26b-a4b":
+  MODEL_VERSION = "google/gemma-4-26B-A4B-it"
+  _DEFAULT_MODEL_DIR = "/tmp/models/gemma-4-26B-A4B-it"
+elif GEMMA4_VARIANT == "31b":
+  MODEL_VERSION = "google/gemma-4-31B-it"
+  _DEFAULT_MODEL_DIR = "/tmp/models/gemma-4-31B-it"
 else:
-  DATA_PATH_PREFIX = "gs://tunix/data/Frozenlake"
-  MODEL_PATH_PREFIX = "gs://tunix/models"
-  CKPT_DIR_PREFIX = "gs://tunix/rl/checkpoints"
+  raise ValueError(
+      f"Unsupported GEMMA4_VARIANT={GEMMA4_VARIANT}; expected '26b-a4b' or '31b'."
+  )
+MODEL_DOWNLOAD_DIR = os.getenv("MODEL_DOWNLOAD_DIR", _DEFAULT_MODEL_DIR)
+DATA_DIR = os.getenv("DATA_DIR", "/tmp/data/frozenlake")
 
-print("NOTEBOOK_ENV: ", NOTEBOOK_ENV)
-import datetime
 now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-CKPT_DIR = os.path.join(CKPT_DIR_PREFIX, f"frozenlake/{now_str}")
+CKPT_DIR = os.getenv("CKPT_DIR") or None
+TB_LOG_DIR = os.getenv("TB_LOG_DIR", "/tmp/tunix-tb/frozenlake")
 
-MODEL_VERSION = "google/gemma-4-26B-A4B-it"
 
-# %%
-show_hbm_usage = sft_utils.show_hbm_usage
+# ====== Build the role meshes ======
+if DISJOINT_MESH:
+  _trainer_chips = math.prod(TRAINER_MESH_SHAPE)
+  _rollout_chips = math.prod(ROLLOUT_MESH_SHAPE)
+  _ref_chips = math.prod(REFERENCE_MESH_SHAPE) if REFERENCE_MESH_SHAPE else 0
+  _need = _trainer_chips + _rollout_chips + _ref_chips
+  if jax.device_count() < _need:
+    raise ValueError(
+        f"Disjoint mesh layout needs {_need} chips "
+        f"(trainer={_trainer_chips}+rollout={_rollout_chips}+ref={_ref_chips}), "
+        f"have {jax.device_count()}."
+    )
+  # Layout in jax.devices() order: [rollout | reference | trainer]
+  _all_devs = jax.devices()
+  _rollout_devs = _all_devs[:_rollout_chips]
+  _ref_devs = _all_devs[_rollout_chips:_rollout_chips + _ref_chips]
+  _trainer_devs = _all_devs[-_trainer_chips:]
+  _rollout_devlist = jax._src.mesh_utils.create_device_mesh(
+      ROLLOUT_MESH_SHAPE, _rollout_devs
+  )
+  rollout_mesh = jax.sharding.Mesh(
+      _rollout_devlist,
+      axis_names=SHARED_MESH_AXIS_NAMES,
+      axis_types=(jax.sharding.AxisType.Auto,) * len(ROLLOUT_MESH_SHAPE),
+  )
+  _trainer_devlist = jax._src.mesh_utils.create_device_mesh(
+      TRAINER_MESH_SHAPE, _trainer_devs
+  )
+  trainer_mesh = jax.sharding.Mesh(
+      _trainer_devlist,
+      axis_names=SHARED_MESH_AXIS_NAMES,
+      axis_types=(jax.sharding.AxisType.Auto,) * len(TRAINER_MESH_SHAPE),
+  )
+  if REFERENCE_MESH_SHAPE:
+    _ref_devlist = jax._src.mesh_utils.create_device_mesh(
+        REFERENCE_MESH_SHAPE, _ref_devs
+    )
+    reference_mesh = jax.sharding.Mesh(
+        _ref_devlist,
+        axis_names=SHARED_MESH_AXIS_NAMES,
+        axis_types=(jax.sharding.AxisType.Auto,) * len(REFERENCE_MESH_SHAPE),
+    )
+  else:
+    reference_mesh = trainer_mesh
+  # shared_mesh kept as an alias for code paths that still reference it
+  # (e.g. LoRA reshard); LoRA + disjoint is not a tested combo.
+  shared_mesh = trainer_mesh
+  print(
+      f"disjoint meshes: trainer={trainer_mesh.devices.shape} "
+      f"rollout={rollout_mesh.devices.shape} reference={reference_mesh.devices.shape}"
+  )
+else:
+  if jax.device_count() < math.prod(SHARED_MESH_SHAPE):
+    raise ValueError(
+        f"Expected at least {math.prod(SHARED_MESH_SHAPE)} devices for mesh "
+        f"{SHARED_MESH_SHAPE}, got {jax.device_count()}."
+    )
 
-# %%
+  shared_device_list = jax._src.mesh_utils.create_device_mesh(
+      SHARED_MESH_SHAPE, jax.devices()[: math.prod(SHARED_MESH_SHAPE)]
+  )
+  shared_mesh = jax.sharding.Mesh(
+      shared_device_list,
+      axis_names=SHARED_MESH_AXIS_NAMES,
+      axis_types=(jax.sharding.AxisType.Auto,) * len(SHARED_MESH_SHAPE),
+  )
+  trainer_mesh = shared_mesh
+  rollout_mesh = shared_mesh
+  reference_mesh = shared_mesh
+  print(f"shared_mesh.devices.shape={shared_mesh.devices.shape}")
+
+# ====== Data ======
 import pandas as pd
 import datasets as datasets_lib
 import transformers
 
+try:
+  from google.cloud import storage  # noqa: F401
+except Exception:
+  pass
+import fsspec
+
 Dataset = datasets_lib.Dataset
 AutoTokenizer = transformers.AutoTokenizer
 
-
-TRAIN_DATA_PATH = os.path.join(
-    DATA_PATH_PREFIX, "train.parquet"
-)
-TEST_DATA_PATH = os.path.join(
-    DATA_PATH_PREFIX, "test.parquet"
-)
+TRAIN_DATA_PATH = os.path.join(DATA_DIR, "train.parquet")
+TEST_DATA_PATH = os.path.join(DATA_DIR, "test.parquet")
 
 
 def create_datasets(
     train_ds_path: str = TRAIN_DATA_PATH,
     test_ds_path: str = TEST_DATA_PATH,
 ):
-  with file_open(train_ds_path) as train_f, file_open(
+  with fsspec.open(train_ds_path, "rb") as train_f, fsspec.open(
       test_ds_path, "rb"
   ) as test_f:
     train_df = pd.read_parquet(train_f)
@@ -369,13 +368,14 @@ def create_datasets(
   return train_ds, test_ds
 
 
-# %%
+tokenizer = AutoTokenizer.from_pretrained(
+    MODEL_VERSION,
+    extra_special_tokens={"video_token": "<|video|>"},
+)
+chat_parser = parser.Gemma4ChatTemplateParser(
+    tokenizer, enable_thinking=ENABLE_THINKING
+)
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL_VERSION)
-
-chat_parser = parser.DefaultChatTemplateParser(tokenizer, enable_thinking=False)
-
-# %%
 train_dataset, test_dataset = create_datasets()
 train_dataset, val_dataset = data_lib.post_init_dataset(
     train_dataset,
@@ -386,7 +386,6 @@ train_dataset, val_dataset = data_lib.post_init_dataset(
     fraction=TRAIN_FRACTION,
     num_epochs=NUM_EPOCHS,
 )
-
 test_dataset, _ = data_lib.post_init_dataset(
     test_dataset,
     tokenizer,
@@ -395,122 +394,152 @@ test_dataset, _ = data_lib.post_init_dataset(
     max_prompt_length=MAX_PROMPT_LENGTH,
 )
 
-# %%
+show_hbm_usage = sft_utils.show_hbm_usage
 show_hbm_usage("Done with loading datasets")
 
-# %%
-config = model_lib.ModelConfig.gemma4_26b_a4b()
-if ENABLE_REMAT:
+# ====== Download + load model ======
+if not os.path.isdir(MODEL_DOWNLOAD_DIR) or not any(
+    f.endswith(".safetensors") for f in os.listdir(MODEL_DOWNLOAD_DIR)
+):
+  os.makedirs(MODEL_DOWNLOAD_DIR, exist_ok=True)
+  oss_utils.hf_pipeline(MODEL_VERSION, MODEL_DOWNLOAD_DIR)
+
+if GEMMA4_VARIANT == "26b-a4b":
+  config = model_lib.ModelConfig.gemma4_26b_a4b()
+else:
+  config = model_lib.ModelConfig.gemma4_31b()
+if _REMAT_ENV == "block":
+  config.remat_config = model_lib.RematConfig.BLOCK
+elif _REMAT_ENV in ("decoder", "1", "true"):
   config.remat_config = model_lib.RematConfig.DECODER
+# REMAT="0" or anything else → leave remat off.
 if ENABLE_FLASH_ATTENTION:
   config.use_flash_attention = True
   config.flash_attention_block_size = 256
 if ENABLE_MIX_PRECISION:
   config.dtype = jnp.bfloat16
-else:
-  config.dtype = jnp.float32
 
-from huggingface_hub import snapshot_download
-
-MODEL_PATH = snapshot_download(repo_id=MODEL_VERSION, max_workers=16, force_download=True)
-print("MODEL_PATH: ", MODEL_PATH)
+# Reference + actor base share the same backbone in HBM. Loading the model
+# twice doubles HBM usage; under LoRA the reference is the un-adapted base,
+# so we alias the same params and let qwix wrap the actor with LoRA on top.
 gemma4_ref = params_lib.create_model_from_safe_tensors(
-    MODEL_PATH, config, reference_mesh, dtype=MODEL_DTYPE
+    MODEL_DOWNLOAD_DIR, config, reference_mesh, dtype=MODEL_DTYPE
 )
-
-# %%
 show_hbm_usage("after loading gemma4_ref")
 
+if TRAIN_WITH_LORA:
+  # bf16 base is safe under LoRA because the base is frozen; only the small
+  # fp32 adapter weights are updated by Adam, so the LR≤1e-5 rounding hazard
+  # that forces full-finetune storage to fp32 does not apply.
+  gemma4_actor_base = gemma4_ref
+  show_hbm_usage("after aliasing gemma4_actor base to ref (shared backbone)")
 
-# %%
-def get_lora_model(base_model, model_mesh):
   lora_provider = qwix.LoraProvider(
       module_path=(
           ".*q_einsum|.*kv_einsum|.*gate_proj|.*down_proj|.*up_proj|"
           ".*attn_vec_einsum"
       ),
-      rank=RANK,
-      alpha=ALPHA,
+      rank=LORA_RANK,
+      alpha=LORA_ALPHA,
+  )
+  model_input = gemma4_actor_base.get_model_input()
+  gemma4_actor = qwix.apply_lora_to_model(
+      gemma4_actor_base, lora_provider, **model_input
   )
 
-  model_input = base_model.get_model_input()
-  lora_model = qwix.apply_lora_to_model(
-      base_model, lora_provider, **model_input
-  )
-
-  with compat.set_mesh(model_mesh):
-    state = nnx.state(lora_model)
-    pspecs = nnx.get_partition_spec(state)
-    sharded_state = jax.lax.with_sharding_constraint(state, pspecs)
-    nnx.update(lora_model, sharded_state)
-
-  return lora_model
-
-
-# %%
-if TRAIN_WITH_LORA:
-  gemma4_actor = get_lora_model(gemma4_ref, trainer_mesh)
+  from tunix.rl import reshard as _reshard
+  gemma4_actor = _reshard.reshard_model_to_mesh(gemma4_actor, trainer_mesh)
+  show_hbm_usage("after wrapping actor with LoRA")
 else:
-  gemma4_actor = params_lib.create_model_from_safe_tensors(
-      MODEL_PATH, config, trainer_mesh, dtype=jnp.bfloat16
+  # Full-finetune actor: storage MUST be fp32 at LR≤1e-5. Adam updates at
+  # typical magnitudes round to zero in bf16 storage, so the policy never
+  # moves. Forward compute can still be bf16 via config.dtype.
+  #
+  # Verification-only path (FORWARD_ONLY_VERIFICATION=1): store actor in
+  # MODEL_DTYPE (e.g. bf16) so the model fits on a single-host TPU. This is
+  # only valid for rollout/trainer numeric-agreement checks (logp_diff,
+  # prob_diff); not for actual training since the Adam-rounding hazard above
+  # still applies.
+  _actor_dtype = (
+      MODEL_DTYPE
+      if os.environ.get("FORWARD_ONLY_VERIFICATION", "0") not in ("0", "false", "False")
+      else jnp.float32
   )
-  # graph, state = nnx.split(gemma4_ref)
-  # trainer_shardings = jax.tree_util.tree_map(
-  #   lambda x: jax.sharding.NamedSharding(
-  #       trainer_mesh,
-  #       x,
-  #   ),
-  #   nnx.get_partition_spec(state),
-  # )
-  # gemma4_actor = nnx.merge(graph, reshard.reshard_pytree(state, trainer_shardings))
+  gemma4_actor = params_lib.create_model_from_safe_tensors(
+      MODEL_DOWNLOAD_DIR, config, trainer_mesh, dtype=_actor_dtype
+  )
+  show_hbm_usage(f"after loading gemma4_actor ({_actor_dtype})")
 
-# %%
-show_hbm_usage("after loading gemma4_actor")
+# ====== Checkpoint + metrics + optimizer ======
+if CKPT_DIR:
+  checkpointing_options = ocp.CheckpointManagerOptions(
+      save_interval_steps=SAVE_INTERVAL_STEPS, max_to_keep=MAX_TO_KEEP
+  )
+else:
+  checkpointing_options = None
 
-# %%
-ModelAgent = model_agent.ModelAgent
-TaskEnvironment = task_environment.TaskEnvironment
-TrajectoryCollectEngine = trajectory_collect_engine.TrajectoryCollectEngine
-
-# %%
-# Ckpt saving
-checkpointing_options = ocp.CheckpointManagerOptions(
-    save_interval_steps=SAVE_INTERVAL_STEPS, max_to_keep=MAX_TO_KEEP
-)
-
-# Metrics logger
-import wandb
 wandb_config = vars(args)
 wandb_config.update({
     "WARMUP_STEPS": WARMUP_STEPS,
     "num_steps": MAX_STEPS,
     "rollout_engine": ROLLOUT_ENGINE,
+    "model_id": MODEL_VERSION,
+    "mesh_shape": (
+        {
+            "trainer": TRAINER_MESH_SHAPE,
+            "rollout": ROLLOUT_MESH_SHAPE,
+            "reference": REFERENCE_MESH_SHAPE,
+        }
+        if DISJOINT_MESH
+        else SHARED_MESH_SHAPE
+    ),
+    "remat": _REMAT_ENV,
+    "enable_thinking": ENABLE_THINKING,
+    "train_with_lora": TRAIN_WITH_LORA,
+    "lora_rank": LORA_RANK if TRAIN_WITH_LORA else 0,
 })
+wandb_kwargs = {"config": wandb_config}
 metrics_logging_options = metrics_logger.MetricsLoggerOptions(
-    log_dir="gs://linchai-bucket-dev/tensorboard/grpo",
-    flush_every_n_steps=20,
-    backend_kwargs={"wandb": {"config": wandb_config, "settings": wandb.Settings(console="off")}},
+    log_dir=TB_LOG_DIR,
+    project_name=os.getenv("WANDB_PROJECT", "tunix-frozenlake"),
+    run_name=os.getenv("WANDB_RUN_NAME", ""),
+    flush_every_n_steps=1,
+    backend_kwargs={"wandb": wandb_kwargs},
 )
 
-# %%
-# Optimizer, learning rate scheduler, gradient clipping
-optimizer = optax.adamw(
-    learning_rate=LEARNING_RATE,
-    b1=B1,
-    b2=B2,
-    weight_decay=WEIGHT_DECAY,
-)
-if MAX_GRAD_NORM is not None:
-  optimizer = optax.chain(
-      optax.clip_by_global_norm(max_norm=MAX_GRAD_NORM),
-      optimizer,
+if os.environ.get("FORWARD_ONLY_VERIFICATION", "0") not in ("0", "false", "False"):
+  # No-op optimizer (no Adam m/v state) so the trainer fits alongside vllm on a
+  # smaller TPU. Only valid when the run's goal is rollout/trainer numeric checks
+  # (logp_diff, prob_diff) rather than actually training.
+  optimizer = optax.set_to_zero()
+else:
+  optimizer = optax.adamw(
+      learning_rate=LEARNING_RATE,
+      b1=B1,
+      b2=B2,
+      weight_decay=WEIGHT_DECAY,
   )
+  if MAX_GRAD_NORM is not None:
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(max_norm=MAX_GRAD_NORM),
+        optimizer,
+    )
 
-# %%
-# Training config
-print("Rollout mesh: ", rollout_mesh)
-print("Trainer mesh: ", trainer_mesh)
-print("Reference mesh: ", reference_mesh)
+# ====== Rollout + RL cluster ======
+print("Shared mesh:", shared_mesh)
+
+# Vanilla sampler stops on these. Gemma4's `<end_of_turn>` marker is required
+# — the instruct model never emits `<eos>` mid-conversation, so without
+# `<end_of_turn>` in `eos_tokens` every rollout runs to MAX_RESPONSE_LENGTH.
+# Also accept Qwen's `<turn|>` and `<|im_end|>` so this same path works across
+# model families.
+_eos_token_ids: list[int] = []
+for tok_str in ("<eos>", "<end_of_turn>", "<turn|>", "<|im_end|>"):
+  ids = tokenizer.encode(tok_str, add_special_tokens=False)
+  if len(ids) == 1:
+    _eos_token_ids.append(ids[0])
+_eos_token_ids = list(dict.fromkeys(_eos_token_ids))
+logging.info("Configured rollout eos_token_ids: %s", _eos_token_ids)
 
 base_rollout_dict = {
     "max_prompt_length": MAX_PROMPT_LENGTH,
@@ -520,19 +549,22 @@ base_rollout_dict = {
     "top_k": TOP_K,
     "return_logprobs": True,
     "max_tokens_to_generate": MAX_RESPONSE_LENGTH,
+    "eos_tokens": _eos_token_ids if _eos_token_ids else None,
 }
 
 vllm_rollout_dict = {
-    # vllm-tpu specific configs
     "rollout_vllm_model_version": MODEL_VERSION,
-    "rollout_vllm_hbm_utilization": 0.6,
+    "rollout_vllm_hbm_utilization": float(os.environ.get("VLLM_HBM_UTIL", "0.30")),
     "rollout_vllm_tpu_backend_type": "jax",
     "rollout_vllm_server_mode": True,
-    "rollout_vllm_enable_dp_attention": True,
     "rollout_vllm_async_scheduling": False,
     "rollout_vllm_init_with_random_weights": True,
-    "tensor_parallel_size": ROLLOUT_MESH[0][1],
-    "data_parallel_size": ROLLOUT_MESH[0][0],
+    "tensor_parallel_size": (
+        ROLLOUT_MESH_SHAPE[1] if DISJOINT_MESH else SHARED_MESH_SHAPE[1]
+    ),
+    "data_parallel_size": (
+        ROLLOUT_MESH_SHAPE[0] if DISJOINT_MESH else SHARED_MESH_SHAPE[0]
+    ),
     "rollout_vllm_delete_dst_buffers": True,
     "rollout_vllm_reshard_chunk_size": 16,
     "rollout_vllm_max_num_seqs": VLLM_MAX_NUM_SEQS,
@@ -567,10 +599,9 @@ cluster_config = rl_cluster_lib.ClusterConfig(
         eval_every_n_steps=EVAL_EVERY_N_STEPS,
         max_steps=MAX_STEPS,
         mini_batch_size=MINI_BATCH_SIZE,
-        train_micro_batch_size=1,
-        # metrics logging
+        train_micro_batch_size=int(os.environ.get("TRAIN_MICRO_BS", 1)),
+        compute_logps_micro_batch_size=int(os.environ.get("COMPUTE_LOGPS_MICRO_BS", 1)),
         metrics_logging_options=metrics_logging_options,
-        # checkpoint saving
         checkpoint_root_directory=CKPT_DIR,
         checkpointing_options=checkpointing_options,
     ),
@@ -590,67 +621,19 @@ grpo_config = GRPOConfig(
     loss_agg_mode=args.loss_agg_mode,
     kl_loss_mode=args.kl_loss_mode,
     loss_algo=args.loss_algo,
-    force_compute_kl=True,
     sampler_is="token",
     sampler_is_threshold=2.0,
     advantage_estimator=args.advantage_estimator,
 )
 
-# Perf Metrics logging
-perf_metrics_config = PerfMetricsConfig(
-    custom_export_fn_v2=PerfMetricsExport.from_cluster_config(
-        cluster_config=cluster_config,
-        trace_dir="/tmp/agentic_perf",
-    ).export_metrics
-)
-
-# %%
-# RL cluster
 rl_cluster = rl_cluster_lib.RLCluster(
     actor=gemma4_actor,
     reference=gemma4_ref,
     tokenizer=tokenizer,
     cluster_config=cluster_config,
-    perf_config=perf_metrics_config,
 )
-
 show_hbm_usage("after RLCluster creation")
 
-
-def length_penalty_reward_fn(
-    prompts: List[str], 
-    completions: List[str], 
-    trajectory_rewards: List[float], 
-    **kwargs
-) -> List[float]:
-  """Computes a group-relative length penalty inspired by Kimi 1.5.
-  
-  Promotes shorter successful paths and penalizes longer ones, 
-  while strictly penalizing long, unsuccessful paths.
-  """
-  lengths = np.array([len(c) for c in completions])
-  
-  min_len = np.min(lengths)
-  max_len = np.max(lengths)
-  
-  rewards = np.zeros_like(lengths, dtype=np.float32)
-  if max_len == min_len:
-    return list(rewards)
-  
-  lambdas = 0.5 - (lengths - min_len) / (max_len - min_len)
-  
-  for i in range(len(completions)):
-    is_correct = trajectory_rewards[i] > 0.1
-    if is_correct:
-      rewards[i] = lambdas[i]
-    else:
-      rewards[i] = min(0.0, lambdas[i])
-  
-  weight = 0.1
-  return list(rewards * weight)
-
-
-# %%
 
 _metric_call_idx = 0
 
@@ -679,10 +662,8 @@ def metric_fn(prompts, completions, rewards, advantages, **kwargs):
   }
 
 
-# GRPO Trainer
 grpo_trainer = GRPOLearner(
     rl_cluster=rl_cluster,
-    # reward_fns=[length_penalty_reward_fn],
     agent_class=FrozenLakeAgent,
     agent_kwargs={"use_multistep_prompt": True},
     env_class=FrozenLakeEnv,
@@ -693,34 +674,27 @@ grpo_trainer = GRPOLearner(
 )
 show_hbm_usage("after GRPOLearner creation")
 
-# %%
 try:
   print("Defragmenting JAX/XLA memory before training...")
   backend = None
   try:
     import jax.extend.backend as jax_backend
     backend = jax_backend.get_backend()
-  except:
+  except Exception:
     try:
       backend = jax.devices()[0].client
-    except:
-      try:
-        from jax._src.lib import xla_bridge
-        backend = xla_bridge.get_backend()
-      except:
-        pass
-  if backend is not None and hasattr(backend, 'defragment'):
+    except Exception:
+      pass
+  if backend is not None and hasattr(backend, "defragment"):
     backend.defragment()
     print("Defragmentation successful!")
   else:
-    print("Defragmentation skipped: backend has no defragment attribute or could not be resolved.")
+    print("Defragmentation skipped: backend has no defragment attribute.")
 except Exception as e:
   print(f"Defragmentation failed: {e}")
 
 import gc
-import jax
 gc.collect()
-# Clear JAX compilation and execution caches
 jax.clear_caches()
 
-grpo_trainer.train(train_dataset)
+grpo_trainer.train(train_dataset, eval_dataset=test_dataset)

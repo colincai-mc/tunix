@@ -350,14 +350,44 @@ def compute_per_token_logps(
   # them: caller-provided packing ids take precedence; otherwise we pass the
   # per-position non-pad mask derived in ``process_ids`` so flash-attention
   # variants that lack a separate padding-mask input still skip pad positions.
-  # if segment_ids is not None:
-  #   model_kwargs["segment_ids"] = segment_ids
-  # elif input_seg_ids is not None:
-  #   model_kwargs["segment_ids"] = input_seg_ids
-  # if images is not None:
-  #   model_kwargs["images"] = images
+  if segment_ids is not None:
+    model_kwargs["segment_ids"] = segment_ids
+  elif input_seg_ids is not None:
+    model_kwargs["segment_ids"] = input_seg_ids
+  if images is not None:
+    model_kwargs["images"] = images
 
   logits, _ = model(input_tokens, **model_kwargs)
+
+  # >>> DIAG-LOGP-UNIFORM <<<
+  # Dump per-position logits statistics so we can identify whether the trainer
+  # forward is producing flat (uniform) logits across vocab. This is gated on
+  # the env var so production runs are unaffected.
+  import os as _os
+  if _os.environ.get("DEBUG_LOGITS", "0") not in ("0", "false", "False"):
+    _logits_std = jnp.std(logits, axis=-1)
+    _logits_mean = jnp.mean(logits, axis=-1)
+    _logits_max = jnp.max(logits, axis=-1)
+    _logits_min = jnp.min(logits, axis=-1)
+    jax.debug.print(
+        "DIAG-LOGITS batch0_pos0_max5={a} batch0_pos-1_max5={b} std[mean,max,min]=[{c},{d},{e}] mean[mean]={f} max[mean]={g} min[mean]={h} shape={s}",
+        a=logits[0, 0, :5],
+        b=logits[0, -1, :5],
+        c=jnp.mean(_logits_std),
+        d=jnp.max(_logits_std),
+        e=jnp.min(_logits_std),
+        f=jnp.mean(_logits_mean),
+        g=jnp.mean(_logits_max),
+        h=jnp.mean(_logits_min),
+        s=logits.shape,
+    )
+    jax.debug.print(
+        "DIAG-INPUT batch0_tokens_first5={t0} non_pad_count={n} input_shape={s}",
+        t0=input_tokens[0, :5],
+        n=jnp.sum(input_tokens != pad_id),
+        s=input_tokens.shape,
+    )
+  # >>> END DIAG <<<
 
   if segment_ids is not None:
     # Packed Mode: Evaluate the full sequence (mixed prompts + completions).

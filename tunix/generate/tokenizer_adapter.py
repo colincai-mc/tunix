@@ -169,7 +169,6 @@ class TokenizerAdapter:
     Raises:
       NotImplementedError: If chat templating is not supported by the tokenizer.
     """
-    print(f"messages before sanitization: {messages}")
     messages = [
         {
             **m,

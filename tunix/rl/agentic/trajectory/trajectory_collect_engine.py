@@ -521,10 +521,27 @@ class TrajectoryCollectEngine:
     )
     logging.debug("%s model_call done", self._debug_prefix)
 
+    import os as _os
+    if _os.environ.get("DEBUG_ROLLOUT", "0") == "1":
+      _txt = rollout_output.text[0] if rollout_output.text else ""
+      _toks = rollout_output.tokens[0] if rollout_output.tokens else []
+      print(
+          f"DIAG-ROLLOUT step={len(self.agent.trajectory.steps)} "
+          f"n_tok={len(_toks)} text[:400]={_txt[:400]!r}",
+          flush=True,
+      )
+
     if rollout_output.tokens:
       self._response_token_count += len(rollout_output.tokens[0])
-    if self._check_and_set_context_limit_reached():
-      return True
+    # NOTE: we defer the context-limit early-return until AFTER we have
+    # persisted the rollout's assistant_tokens/logprobs onto the current step.
+    # If we return early here, ``update_from_model`` is never called, the step
+    # is never appended to ``trajectory.steps``, and the tokens we just paid
+    # to generate are dropped — the trajectory is then trained on as if the
+    # rollout produced zero assistant tokens (the sampler-trainer logp
+    # agreement metric goes to 0/0 and the optimizer sees an empty
+    # completion).
+    _context_limit_after_rollout = self._check_and_set_context_limit_reached()
 
     action = self.agent.update_from_model(rollout_output.text[0]).action
     logging.debug(
@@ -540,6 +557,25 @@ class TrajectoryCollectEngine:
 
     step_idx = len(self.agent.trajectory.steps)
     remaining_time = self.timeout - (time.perf_counter() - self._start_ts)
+
+    if _context_limit_after_rollout:
+      # The rollout we just persisted has already pushed total response tokens
+      # over the budget; do not bother calling env.step (it may be expensive
+      # or hang). Capture the assistant tokens on the step that was just
+      # appended by ``update_from_model`` and exit.
+      cur_step = self.agent.get_current_step()
+      if cur_step is not None:
+        if rollout_output.logprobs is not None:
+          cur_step.logprobs = rollout_output.logprobs[0]
+        if (
+            self.tokenizer
+            and self.chat_parser
+            and rollout_output.tokens is not None
+            and len(rollout_output.tokens) > 0
+        ):
+          cur_step.assistant_tokens = rollout_output.tokens[0]
+          cur_step.assistant_masks = np.ones_like(rollout_output.tokens[0])
+      return True
 
     tags = self._get_perf_tags()
     try:
@@ -594,6 +630,28 @@ class TrajectoryCollectEngine:
 
     cur_step = self.agent.get_current_step()
 
+    _tokens_len = (
+        len(rollout_output.tokens[0])
+        if rollout_output.tokens is not None and len(rollout_output.tokens) > 0
+        else -1
+    )
+    _logp_len = (
+        len(rollout_output.logprobs[0])
+        if rollout_output.logprobs is not None
+        and len(rollout_output.logprobs) > 0
+        else -1
+    )
+    logging.info(
+        "TRAJ_ENGINE_DEBUG step_idx=%d cur_step=%s tok_len=%d logp_len=%d"
+        " has_tokenizer=%s has_chat_parser=%s",
+        len(self.agent.trajectory.steps) - 1 if self.agent.trajectory.steps else -1,
+        cur_step is not None,
+        _tokens_len,
+        _logp_len,
+        self.tokenizer is not None,
+        self.chat_parser is not None,
+    )
+
     if cur_step is not None and rollout_output.logprobs is not None:
       cur_step.logprobs = rollout_output.logprobs[0]
 
@@ -601,6 +659,12 @@ class TrajectoryCollectEngine:
     if cur_step is not None and self.tokenizer and self.chat_parser:
       assistant_message, env_messages = (
           utils.get_recent_assistant_user_messages(self.agent.chat_completions)
+      )
+      logging.info(
+          "TRAJ_ENGINE_DEBUG asst_msg_present=%s env_msgs_n=%d done=%s",
+          bool(assistant_message),
+          len(env_messages) if env_messages else 0,
+          done,
       )
 
       # Assistant tokens/masks
